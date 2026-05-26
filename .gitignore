@@ -1,0 +1,6 @@
+.venv/
+__pycache__/
+*.pyc
+
+# Personal glossary — copy vocab.example.txt to vocab.txt and customize.
+vocab.txt

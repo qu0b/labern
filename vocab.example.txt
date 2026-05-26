@@ -1,0 +1,26 @@
+# Example glossary fed to Whisper as initial_prompt bias (one term per line, # = comment).
+#
+# Copy this to `vocab.txt` (which is gitignored) and fill it with YOUR own jargon:
+#     cp vocab.example.txt vocab.txt
+#
+# NOTE: only the WHISPER engine (Right Ctrl) uses this — Parakeet (Right Shift) ignores it.
+# Keep to UNUSUAL tokens (usernames, product/tool/client names, codenames, acronyms);
+# ordinary words already transcribe fine, so don't pad this with common vocabulary.
+# BUDGET: Whisper uses only the LAST ~223 tokens of the prompt, and an over-long prompt
+# degrades quality — keep it tight. Put must-get-right terms LAST so they always survive.
+# The token count is printed on startup ("vocab bias: N terms").
+
+# --- dev tooling (examples — replace with your stack) ---
+kubectl
+Terraform
+Postgres
+Grafana
+OAuth
+
+# --- product / project names ---
+Acme
+Widgetly
+
+# --- people / usernames ---
+# alice
+# bob
