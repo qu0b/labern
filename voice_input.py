@@ -12,15 +12,15 @@ $VOICE_INPUT_API_KEY); otherwise — or if the endpoint is unreachable — it us
 local faster-whisper model. Works fully offline out of the box.
 
 Setup:
-    pip install -r requirements.txt
+    uv sync                           # build .venv from pyproject.toml
     sudo apt install xdotool          # X11 keystroke injection
     # Wayland: sudo apt install wtype
 
 Usage:
-    python voice_input.py --no-tray              # headless
-    python voice_input.py --no-remote            # force the local model
-    python voice_input.py --model small          # local fallback size
-    python voice_input.py --language en          # force one language on every key
+    uv run voice_input.py --no-tray              # headless
+    uv run voice_input.py --no-remote            # force the local model
+    uv run voice_input.py --model small          # local fallback size
+    uv run voice_input.py --language en          # force one language on every key
 
 Hotkey notes (Linux/X11):
     Modifiers (ctrl_r, shift_r, alt_r) are ideal — single press, no Fn, emit no

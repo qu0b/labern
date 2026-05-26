@@ -1,0 +1,21 @@
+[project]
+name = "labern"
+version = "0.1.0"
+description = "Push-to-talk voice dictation — hold a key, speak, release, text appears at your cursor."
+readme = "README.md"
+requires-python = ">=3.9"
+license = "MIT"
+dependencies = [
+    "faster-whisper>=1.0.0",
+    "sounddevice>=0.4.6",
+    "numpy>=1.24.0",
+    "pynput>=1.7.6",
+    "pystray>=0.19.5",
+    "Pillow>=10.0.0",
+    "requests>=2.28.0",
+]
+
+# Single-file tool, not an installable package: uv builds a .venv with the
+# dependencies but does not try to build/install labern itself. Run with `uv run`.
+[tool.uv]
+package = false

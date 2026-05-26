@@ -40,12 +40,13 @@ The two key/engine mappings, including the remote model names, live in the
 ```bash
 git clone https://git.starflinger.eu/starflinger/labern.git
 cd labern
-./install.sh        # apt deps + venv + desktop launcher + login autostart
+./install.sh        # uv env + apt deps + desktop launcher + login autostart
 ```
 
-`install.sh` installs `xdotool` (X11 keystroke injection), PortAudio, and an
-AppIndicator tray extension, creates a `.venv`, and registers a GNOME autostart
-entry so it runs on login. Re-running it is safe (idempotent).
+`install.sh` installs [uv](https://docs.astral.sh/uv/) (if missing), `xdotool`
+(X11 keystroke injection), PortAudio, and an AppIndicator tray extension, runs
+`uv sync` to build the `.venv` from `pyproject.toml`, and registers a GNOME
+autostart entry so it runs on login. Re-running it is safe (idempotent).
 
 > **Wayland:** keystroke injection uses `wtype` instead of `xdotool` —
 > `sudo apt install wtype`. (`xdotool` only works under X11.)
@@ -53,10 +54,8 @@ entry so it runs on login. Re-running it is safe (idempotent).
 ### macOS
 
 ```bash
-brew install portaudio
-python3 -m venv .venv && . .venv/bin/activate
-pip install -r requirements.txt
-python voice_input.py
+brew install uv portaudio
+uv run voice_input.py        # uv builds the .venv from pyproject.toml on first run
 ```
 
 Typing is done via AppleScript, so grant your terminal (or Python) **Accessibility**
@@ -65,10 +64,10 @@ hotkey listener and keystroke injection both require it.
 
 ### Manual (any platform)
 
+Requires [uv](https://docs.astral.sh/uv/) (`curl -LsSf https://astral.sh/uv/install.sh | sh`):
+
 ```bash
-python3 -m venv .venv && . .venv/bin/activate
-pip install -r requirements.txt
-python voice_input.py
+uv run voice_input.py        # resolves + installs deps into .venv, then runs
 ```
 
 ## Configuration
@@ -79,8 +78,8 @@ Nothing to configure — the first run downloads a small Whisper model and you'r
 typing by voice. Pick a bigger/smaller local model with `--model`:
 
 ```bash
-python voice_input.py --model small      # tiny | base | small | medium | large-v3
-python voice_input.py --device cuda       # use an NVIDIA GPU for the local model
+uv run voice_input.py --model small      # tiny | base | small | medium | large-v3
+uv run voice_input.py --device cuda       # use an NVIDIA GPU for the local model
 ```
 
 ### Remote endpoint (optional, faster + better quality)
@@ -92,7 +91,7 @@ Groq, etc. Set the URL and an API key:
 ```bash
 export VOICE_INPUT_REMOTE_URL="https://api.openai.com/v1/audio/transcriptions"
 export VOICE_INPUT_API_KEY="sk-..."        # or write it to ~/.config/voice-input/api_key
-python voice_input.py
+uv run voice_input.py
 ```
 
 ```bash
@@ -138,7 +137,7 @@ laptop **Fn key is invisible to software** and cannot be bound.
 ## Usage
 
 ```
-python voice_input.py [options]
+uv run voice_input.py [options]
 
   -m, --model SIZE      local fallback model (tiny|base|small|medium|large-v3)  [small]
   -d, --device DEV      cpu | cuda                                              [cpu]
