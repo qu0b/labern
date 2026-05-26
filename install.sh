@@ -28,9 +28,9 @@ sudo apt install -y \
 echo "==> syncing Python deps with uv"
 uv sync --project "$SCRIPT_DIR"
 
-# 4. Pre-download default whisper model so first run is fast
-echo "==> pre-downloading whisper base model"
-"$PYTHON" -c "from faster_whisper import WhisperModel; WhisperModel('base', device='cpu', compute_type='int8')"
+# 4. Pre-download default whisper model so first run is fast (matches --model default)
+echo "==> pre-downloading whisper small model"
+"$PYTHON" -c "from faster_whisper import WhisperModel; WhisperModel('small', device='cpu', compute_type='int8')"
 
 # 5. Desktop entry (applications menu)
 APP_DIR="$HOME/.local/share/applications"

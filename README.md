@@ -38,7 +38,7 @@ The two key/engine mappings, including the remote model names, live in the
 ### Linux (X11 or Wayland)
 
 ```bash
-git clone https://git.starflinger.eu/starflinger/labern.git
+git clone https://github.com/qu0b/labern.git
 cd labern
 ./install.sh        # uv env + apt deps + desktop launcher + login autostart
 ```
