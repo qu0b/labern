@@ -132,7 +132,10 @@ class VoiceInput:
         self.agent_max_steps = agent.get("max_steps", 6)       # tool-loop iteration cap
         self.vision = bool(agent.get("vision", False))         # send tool images to the model
         self.image_output = bool(agent.get("image_output", True))  # tool images → clipboard
-        self.tools_config = tools_config or {}
+        self.tools_config = dict(tools_config or {})
+        self._base_tools_config = dict(self.tools_config)
+        self.projects_dir = os.path.expanduser(
+            self.tools_config.get("projects_dir") or "~/repos")
         self.pipelines = pipelines or {}
         self.context_rules = context_rules or []
         self._compiled_rules = self._compile_context_rules(self.context_rules)
@@ -395,30 +398,71 @@ class VoiceInput:
         for i, rule in enumerate(rules):
             matchers = []
             for field, pat in rule.items():
-                if field == "pipeline":
+                if field in ("pipeline", "root"):  # non-regex directives
                     continue
                 try:
                     matchers.append((field, re.compile(pat)))
                 except (re.error, TypeError) as e:
                     raise SystemExit(f"bad context rule #{i} field '{field}': {e}")
-            compiled.append((matchers, rule.get("pipeline")))
+            compiled.append((matchers, rule))
         return compiled
 
     def _select_pipeline(self, binding, ctx):
         """First context rule whose every regex matches ctx wins; else binding default."""
-        for matchers, pipeline in self._compiled_rules:
+        for matchers, rule in self._compiled_rules:
             if all(rx.search(ctx.get(field, "") or "") for field, rx in matchers):
-                return pipeline
+                return rule.get("pipeline")
         return binding.get("pipeline")
 
-    def _agent_step(self, text, step):
+    def _resolve_root(self, ctx):
+        """Project root for code/file tools, from the focused window: a context
+        rule's `root`, else a repo under projects_dir whose name appears in the
+        window title, else the configured default. Lets the agent search the repo
+        you're actually focused on instead of a fixed path."""
+        wl = (ctx.get("window") or "").lower()
+        for matchers, rule in self._compiled_rules:
+            if rule.get("root") and all(
+                    rx.search(ctx.get(f, "") or "") for f, rx in matchers):
+                return os.path.expanduser(rule["root"])
+        if wl and os.path.isdir(self.projects_dir):
+            try:
+                names = [d for d in os.listdir(self.projects_dir)
+                         if os.path.isdir(os.path.join(self.projects_dir, d))]
+            except OSError:
+                names = []
+            hits = sorted((d for d in names if d.lower() in wl), key=len, reverse=True)
+            if hits:
+                return os.path.join(self.projects_dir, hits[0])
+        return self._base_tools_config.get("root") or os.getcwd()
+
+    @staticmethod
+    def _context_note(ctx, root):
+        """Preamble telling the agent where the user is dictating + which repo."""
+        bits = []
+        if ctx.get("app"):
+            bits.append(f"app: {ctx['app']}")
+        if ctx.get("window"):
+            bits.append(f"window: {ctx['window']!r}")
+        if ctx.get("role"):
+            bits.append(f"field: {ctx['role']}")
+        note = ("The user is dictating into — " + "; ".join(bits) + ".") if bits else ""
+        if root:
+            note += (f"\nTheir active project root is {root}; pass that path to the "
+                     "code/file tools (semantic_search, explore, file_list, read_file, "
+                     "tree_sitter, lsp) unless the request clearly points elsewhere.")
+        return note
+
+    def _agent_step(self, text, step, ctx_note=""):
         """POST one transform step to the agent endpoint. Prefers the Anthropic
         /v1/messages API (system top-level, max_tokens required); falls back to
         the OpenAI /v1/chat/completions shape when the URL points there. A step
-        with `tools` runs the agentic tool-use loop instead. Returns
-        (reply_text, image_paths) — images come only from tool-producing steps."""
+        with `tools` runs the agentic tool-use loop instead. ctx_note (app/window/
+        repo) is appended to the system prompt of tool steps so the agent knows
+        where it is. Returns (reply_text, image_paths)."""
         import requests
         model, system = step.get("model") or self.agent_model, step["prompt"]
+        if ctx_note and step.get("tools"):  # situational awareness for agent steps
+            system = f"{system}\n\n{ctx_note}"
         is_messages = self.agent_url.rstrip("/").endswith("/messages")
         if step.get("tools") and is_messages:
             return self._agent_tool_loop(text, system, model, step["tools"])
@@ -552,16 +596,22 @@ class VoiceInput:
     def _refine(self, text, binding):
         """Chain the selected pipeline's steps. Returns (text, name, images) where
         images are any artifacts tools produced. Fail-open: keep best text on error."""
-        name = self._select_pipeline(binding, self._context())
+        ctx = self._context()
+        name = self._select_pipeline(binding, ctx)
         if not name or name == "raw":
             return text, None, []
         steps = self.pipelines.get(name)
         if not steps or not self.agent_url:
             return text, None, []  # warning was already printed at startup
+        # Scope code/file tools to the repo the user is focused on, and tell the
+        # agent where it is (app + window + repo) — context the user expects.
+        root = self._resolve_root(ctx)
+        self.tools_config = {**self._base_tools_config, "root": root}
+        note = self._context_note(ctx, root)
         out, images = text, []
         for i, step in enumerate(steps):
             try:
-                new, imgs = self._agent_step(out, step)
+                new, imgs = self._agent_step(out, step, note)
                 images.extend(imgs)
                 if new:
                     out = new
