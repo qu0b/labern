@@ -66,14 +66,18 @@ TTS_MODEL = os.environ.get("LABERN_TTS_MODEL", "kokoro")
 STT_MODEL = os.environ.get("LABERN_STT_MODEL", "whisper-large-v3-turbo")
 CACHE = "/tmp/labern_testdata"
 
-# A small "sample dataset": (label, spoken text, voice). Mix of sloppy grammar
-# (exercises the refine pipeline) and clean commands (exercises round-trip fidelity).
+# Sample dataset: (label, spoken text, voice, pipeline). The "refine" rows exercise
+# prose cleanup; the "agent" rows exercise the semantic_search tool loop over the
+# labern repo (skipped if colgrep is absent).
 DATASET = [
-    ("grammar1", "so i was thinkin we shud add a retry to the conection pool becuase it keeps droping under load", "af_heart"),
-    ("grammar2", "the function dont return nothing when the input is empty it just crash", "am_michael"),
-    ("command1", "create a new branch called fix slash auth and open a pull request", "af_bella"),
-    ("mixed1", "can you check why the deploy failed yesterday and summarize the root cause for me", "bf_emma"),
+    ("grammar1", "so i was thinkin we shud add a retry to the conection pool becuase it keeps droping under load", "af_heart", "refine"),
+    ("grammar2", "the function dont return nothing when the input is empty it just crash", "am_michael", "refine"),
+    ("command1", "create a new branch called fix slash auth and open a pull request", "af_bella", "refine"),
+    ("agent1", "how does labern fall back to a local model when the remote transcription endpoint fails", "bf_emma", "agent"),
+    ("agent2", "what keybindings does labern use and which engine does each one run", "am_michael", "agent"),
 ]
+
+HAVE_COLGREP = bool(__import__("shutil").which("colgrep"))
 
 
 def _key():
@@ -124,36 +128,47 @@ def load_16k_int16(path):
 
 def main():
     key = _key()
-    # A VoiceInput wired for remote STT + a one-step "refine" chat pipeline.
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    # A VoiceInput wired for remote STT + two pipelines: prose "refine" and a
+    # tool-using "agent" (semantic_search over this repo).
     vi = voice_input.VoiceInput(
         bindings=[{"key": "shift_r", "model": STT_MODEL, "language": None,
                    "label": "test", "pipeline": "refine"}],
         model_size="small", device="cpu", use_tray=False, initial_prompt=None,
         remote_url=STT_URL, api_key=key,
-        agent={"url": CHAT_URL, "model": CHAT_MODEL, "timeout": 60},
-        pipelines={"refine": [{"prompt":
-            "Fix spelling, grammar, and punctuation in this dictated text. "
-            "Output ONLY the corrected text, nothing else."}]},
-        context_rules=[],
+        agent={"url": CHAT_URL, "model": CHAT_MODEL, "timeout": 90, "max_steps": 4},
+        pipelines={
+            "refine": [{"prompt":
+                "Fix spelling, grammar, and punctuation in this dictated text. "
+                "Output ONLY the corrected text, nothing else."}],
+            "agent": [{"tools": ["semantic_search"], "prompt":
+                "You are a dictation assistant with tools. Use semantic_search to "
+                "locate relevant code, then write a concise answer for the cursor."}],
+        },
+        context_rules=[], tools_config={"root": repo_root},
         run_context_listener=False,
     )
     binding = vi.bindings[0]
 
     print(f"\n{'='*72}\nlabern e2e: TTS → _transcribe_remote → _refine ({CHAT_MODEL})\n{'='*72}")
     failures = 0
-    for label, text, voice in DATASET:
+    for label, text, voice, pipeline in DATASET:
+        if pipeline == "agent" and not HAVE_COLGREP:
+            print(f"\n[{label}]  SKIPPED (colgrep not installed)")
+            continue
         wav = synth(label, text, voice, key)
         audio = load_16k_int16(wav)
         raw = (vi._transcribe_remote(audio, STT_MODEL, None) or "").strip()
-        refined, pipe = vi._refine(raw, binding)
+        binding["pipeline"] = pipeline
+        out, pipe = vi._refine(raw, binding)
         print(f"\n[{label}]  voice={voice}  pipeline={pipe}")
         print(f"  spoken : {text}")
         print(f"  STT    : {raw}")
-        print(f"  refined: {refined}")
+        print(f"  output : {out}")
         if not raw:
             print("  !! STT returned empty"); failures += 1
-        if not refined.strip():
-            print("  !! refine returned empty"); failures += 1
+        if not out.strip():
+            print("  !! pipeline returned empty"); failures += 1
 
     print(f"\n{'='*72}\n{'FAILED' if failures else 'OK'}: "
           f"{len(DATASET)} samples, {failures} problem(s)\n{'='*72}")

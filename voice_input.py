@@ -93,7 +93,7 @@ def _preexec_pdeath():
 class VoiceInput:
     def __init__(self, bindings, model_size, device, use_tray, initial_prompt,
                  remote_url=None, api_key=None,
-                 agent=None, pipelines=None, context_rules=None,
+                 agent=None, pipelines=None, context_rules=None, tools_config=None,
                  run_context_listener=True):
         self.use_tray = use_tray
         self.initial_prompt = initial_prompt
@@ -129,6 +129,8 @@ class VoiceInput:
         self.agent_model = agent.get("model")
         self.agent_timeout = agent.get("timeout", 60)
         self.agent_max_tokens = agent.get("max_tokens", 2048)  # required by /v1/messages
+        self.agent_max_steps = agent.get("max_steps", 6)       # tool-loop iteration cap
+        self.tools_config = tools_config or {}
         self.pipelines = pipelines or {}
         self.context_rules = context_rules or []
         self._compiled_rules = self._compile_context_rules(self.context_rules)
@@ -336,6 +338,13 @@ class VoiceInput:
         if (referenced - missing) and not self.agent_url:
             print("[warn: pipelines configured but agent.url is unset — "
                   "all pipelines will be skipped (raw transcript typed)]")
+        from voice_input_tools import TOOLS
+        used = {t for steps in self.pipelines.values() for step in steps
+                for t in (step.get("tools") or [])}
+        unknown = used - set(TOOLS)
+        if unknown:
+            print(f"[warn: pipeline steps reference unknown tools {sorted(unknown)} "
+                  f"— available: {sorted(TOOLS)}]")
 
     def _start_context_listener(self):
         """Spawn the AT-SPI focus listener. Fail-open: cache stays empty on error."""
@@ -399,11 +408,14 @@ class VoiceInput:
     def _agent_step(self, text, step):
         """POST one transform step to the agent endpoint. Prefers the Anthropic
         /v1/messages API (system top-level, max_tokens required); falls back to
-        the OpenAI /v1/chat/completions shape when the URL points there. Returns
-        the model's reply text."""
+        the OpenAI /v1/chat/completions shape when the URL points there. A step
+        with `tools` runs the agentic tool-use loop instead. Returns reply text."""
         import requests
         model, system = step.get("model") or self.agent_model, step["prompt"]
-        if self.agent_url.rstrip("/").endswith("/messages"):  # Anthropic Messages
+        is_messages = self.agent_url.rstrip("/").endswith("/messages")
+        if step.get("tools") and is_messages:
+            return self._agent_tool_loop(text, system, model, step["tools"])
+        if is_messages:  # Anthropic Messages
             resp = requests.post(
                 self.agent_url,
                 headers={"Authorization": f"Bearer {self.api_key}",
@@ -428,6 +440,85 @@ class VoiceInput:
         )
         resp.raise_for_status()
         return resp.json()["choices"][0]["message"]["content"].strip()
+
+    def _agent_tool_loop(self, text, system, model, tool_names):
+        """Gather-then-synthesize. Phase 1: let the model call tools (tool_choice
+        auto), collecting their results; if it answers directly, use that. Phase 2
+        (on hitting max_steps without an answer): a fresh, TOOL-FREE call that hands
+        the model the findings and asks for prose — search-eager models (minimax)
+        keep searching when tools are present but answer cleanly when they aren't."""
+        from voice_input_tools import TOOLS
+        tools = [TOOLS[n]["schema"] for n in tool_names if n in TOOLS]
+        messages = [{"role": "user", "content": text}]
+        findings = []
+        for _ in range(self.agent_max_steps):
+            data = self._messages_call(model, system, messages, tools=tools)
+            blocks = data.get("content") or []
+            if data.get("stop_reason") != "tool_use":
+                answer = self._strip_tool_markup(
+                    "".join(b.get("text", "") for b in blocks if b.get("type") == "text"))
+                if answer.strip():
+                    return answer.strip()
+                break  # leaked markup only → fall through to synthesis
+            messages.append({"role": "assistant", "content": blocks})
+            results = []
+            for b in blocks:
+                if b.get("type") == "tool_use":
+                    out = self._run_tool(b.get("name"), b.get("input") or {})
+                    findings.append(f"{b.get('name')}({b.get('input')}):\n{out}")
+                    results.append({"type": "tool_result",
+                                    "tool_use_id": b.get("id"), "content": out})
+            messages.append({"role": "user", "content": results})
+        return self._agent_synthesize(model, system, text, findings)
+
+    def _agent_synthesize(self, model, system, question, findings):
+        """Fresh tool-free call: write the final answer from gathered findings."""
+        if not findings:
+            return ""
+        digest = "\n\n".join(findings)[:8000]
+        msg = (f"Spoken request: {question}\n\nTool findings:\n{digest}\n\n"
+               "Using only the findings above, produce the final text to insert at "
+               "the cursor now. Do not call tools, do not mention tools — output only "
+               "the answer.")
+        data = self._messages_call(model, system, [{"role": "user", "content": msg}])
+        blocks = data.get("content") or []
+        return self._strip_tool_markup(
+            "".join(b.get("text", "") for b in blocks if b.get("type") == "text")).strip()
+
+    def _messages_call(self, model, system, messages, tools=None):
+        """One Anthropic /v1/messages POST; returns the parsed JSON."""
+        import requests
+        payload = {"model": model, "max_tokens": self.agent_max_tokens,
+                   "system": system, "messages": messages}
+        if tools:
+            payload["tools"] = tools
+        resp = requests.post(
+            self.agent_url,
+            headers={"Authorization": f"Bearer {self.api_key}",
+                     "anthropic-version": "2023-06-01"},
+            json=payload, timeout=self.agent_timeout,
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    @staticmethod
+    def _strip_tool_markup(s):
+        """Safety net: remove any native tool-call markup a model leaks as text."""
+        s = re.sub(r"<[^>]*tool_call>.*?</[^>]*tool_call>", "", s, flags=re.S)
+        s = re.sub(r"<invoke\b.*?</invoke>", "", s, flags=re.S)
+        return s
+
+    def _run_tool(self, name, args):
+        """Execute one local tool by name. Errors come back as text for the model."""
+        from voice_input_tools import TOOLS
+        tool = TOOLS.get(name)
+        if not tool:
+            return f"error: unknown tool '{name}'"
+        print(f"  [tool] {name}({', '.join(f'{k}={v!r}' for k, v in args.items())})")
+        try:
+            return tool["run"](args, self)
+        except Exception as e:
+            return f"error running {name}: {e}"
 
     def _refine(self, text, binding):
         """Chain the selected pipeline's steps. Fail-open: keep best text on error."""
@@ -599,6 +690,7 @@ def main():
         agent["url"] = args.agent_url
     pipelines = config.get("pipeline") or {}        # {name: [step, ...]}
     context_rules = config.get("context") or []    # [{field: regex, ..., pipeline: name}, ...]
+    tools_config = config.get("tools") or {}        # {root: ..., ...} for local tools
     if args.no_pipeline:                            # debug escape hatch
         for b in bindings:
             b.pop("pipeline", None)
@@ -607,6 +699,7 @@ def main():
     VoiceInput(bindings, args.model, args.device, args.tray,
                prompt, remote_url, api_key,
                agent=agent, pipelines=pipelines, context_rules=context_rules,
+               tools_config=tools_config,
                run_context_listener=not args.no_context_listener).run()
 
 

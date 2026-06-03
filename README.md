@@ -165,11 +165,21 @@ role = "text"                        # are Python regexes (re.search), matched
 pipeline = "refine"                  # against the focused-widget snapshot.
 ```
 
-**Thin-client design.** labern POSTs text and pastes the reply — that's it.
-Tools (web search, code search, file search…) live on the *endpoint* (e.g. a
-Hermes-agent server). The same primitive at a plain LLM endpoint does grammar
-or formatting; at an agent endpoint it does research-and-rewrite. labern itself
-ships no tool-calling loop and no tools.
+**Two kinds of step.** A plain step POSTs text and pastes the reply (grammar,
+formatting, translation). A step with `tools = [...]` runs an **agentic
+tool-use loop**: labern sends the transcript plus tool schemas, the model
+requests a tool, labern runs it *locally* and feeds the result back, repeating
+until the model answers (capped by `[agent].max_steps`, then a tool-free
+synthesis call forces a final answer). Tools are registered in
+`voice_input_tools.py` and run on your machine:
+
+| Tool | What it does |
+|------|--------------|
+| `semantic_search` | semantic code search over `[tools].root` via [colgrep](https://github.com/) — returns matching units (file, line, snippet) |
+
+So "find where we handle auth errors and summarize" dictated into the agent
+pipeline searches your code and types a grounded answer. (Tool execution uses
+the Anthropic `tool_use` blocks of `/v1/messages`.)
 
 **Per-key default.** `shift_r` defaults to the `agent` pipeline; `ctrl_r`
 stays raw. Override either by editing `BINDINGS` in `voice_input.py` or by
