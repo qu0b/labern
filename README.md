@@ -175,11 +175,23 @@ synthesis call forces a final answer). Tools are registered in
 
 | Tool | What it does |
 |------|--------------|
-| `semantic_search` | semantic code search over `[tools].root` via [colgrep](https://github.com/) — returns matching units (file, line, snippet) |
+| `semantic_search` | semantic code search over `[tools].root` via colgrep — returns matching units (file, line, snippet) |
+| `browser_use` | open a URL in a real browser, screenshot + read page text (ad-hoc browsing) |
+| `playwright` | screenshot a URL at an **exact viewport size** (deterministic, repeatable) |
 
-So "find where we handle auth errors and summarize" dictated into the agent
-pipeline searches your code and types a grounded answer. (Tool execution uses
-the Anthropic `tool_use` blocks of `/v1/messages`.)
+So "find where we handle auth errors and summarize" searches your code and types
+a grounded answer; "screenshot example.com at 1024×768" captures the page. (Tool
+execution uses the Anthropic `tool_use` blocks of `/v1/messages`.)
+
+**Images: vision-ready + clipboard pass-through.** Tools that produce images
+(the browser tools) feed them back two ways, both configurable under `[agent]`:
+
+- `vision = true` attaches screenshots to the model as image blocks — set this
+  only with a vision model (e.g. `qwen3-vl`); text-only models (minimax) keep it
+  `false` and receive the page text instead.
+- `image_output = true` (default) copies the screenshot to your **clipboard**, so
+  you can paste it straight into whatever you're prompting — the image reaches the
+  output without the pipeline model having to describe it.
 
 **Per-key default.** `shift_r` defaults to the `agent` pipeline; `ctrl_r`
 stays raw. Override either by editing `BINDINGS` in `voice_input.py` or by

@@ -160,7 +160,7 @@ def main():
         audio = load_16k_int16(wav)
         raw = (vi._transcribe_remote(audio, STT_MODEL, None) or "").strip()
         binding["pipeline"] = pipeline
-        out, pipe = vi._refine(raw, binding)
+        out, pipe, _images = vi._refine(raw, binding)
         print(f"\n[{label}]  voice={voice}  pipeline={pipe}")
         print(f"  spoken : {text}")
         print(f"  STT    : {raw}")

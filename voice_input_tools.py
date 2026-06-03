@@ -12,6 +12,7 @@ First tool: semantic_search → colgrep (semantic code search, ColBERT-backed).
 import json
 import os
 import subprocess
+import tempfile
 
 
 def _semantic_search(args, vi=None):
@@ -54,6 +55,79 @@ def _semantic_search(args, vi=None):
     return json.dumps(hits or [{"note": "no matches"}])
 
 
+def _png_path(prefix):
+    fd, path = tempfile.mkstemp(prefix=prefix, suffix=".png")
+    os.close(fd)
+    return path
+
+
+def _browser_use(args, vi=None):
+    """Ephemeral browsing via the browser-use CLI: navigate, screenshot, read text.
+    Stateful agentic browser — best for one-off 'go here and grab this'. Returns
+    {text, images}. Needs IN_DOCKER=true (no-sandbox) on this AppArmor host."""
+    url = (args.get("url") or "").strip()
+    if not url:
+        return "error: 'url' is required"
+    env = {**os.environ, "IN_DOCKER": "true"}
+    try:
+        nav = subprocess.run(["browser-use", "open", url],
+                             capture_output=True, text=True, timeout=60, env=env)
+    except FileNotFoundError:
+        return "error: browser-use is not installed"
+    except subprocess.TimeoutExpired:
+        return "error: browser-use open timed out"
+    if nav.returncode != 0:
+        return f"error: browser-use open failed: {nav.stderr.strip()[:300]}"
+    png = _png_path("labern_bu_")
+    shot = subprocess.run(["browser-use", "screenshot"] + (["--full"] if args.get("full") else []) + [png],
+                          capture_output=True, text=True, timeout=60, env=env)
+    if shot.returncode != 0 or not os.path.exists(png):
+        return f"error: screenshot failed: {shot.stderr.strip()[:300]}"
+    text = ""
+    state = subprocess.run(["browser-use", "--json", "state"],
+                           capture_output=True, text=True, timeout=30, env=env)
+    try:
+        text = json.loads(state.stdout).get("data", {}).get("_raw_text", "")
+    except ValueError:
+        pass
+    return {"text": f"browser-use screenshot of {url}\n{text[:1500]}", "images": [png]}
+
+
+def _playwright(args, vi=None):
+    """Deterministic browsing via Playwright (Microsoft): navigate at an exact
+    viewport size, screenshot, read text. Best for repeatable captures and
+    specific page sizes. Returns {text, images}."""
+    url = (args.get("url") or "").strip()
+    if not url:
+        return "error: 'url' is required"
+    try:
+        width = max(320, min(int(args.get("width") or 1280), 3840))
+        height = max(240, min(int(args.get("height") or 800), 2160))
+    except (TypeError, ValueError):
+        width, height = 1280, 800
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        return "error: playwright not installed (uv pip install playwright)"
+    png = _png_path("labern_pw_")
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(args=["--no-sandbox"])  # AppArmor host
+            page = browser.new_page(viewport={"width": width, "height": height})
+            page.goto(url, wait_until="load", timeout=30000)
+            title, body = page.title(), ""
+            try:
+                body = page.inner_text("body")[:1500]
+            except Exception:
+                pass
+            page.screenshot(path=png, full_page=bool(args.get("full")))
+            browser.close()
+    except Exception as e:
+        return f"error: playwright failed: {e}"
+    return {"text": f"playwright screenshot of {url} ({title}) at {width}x{height}\n{body}",
+            "images": [png]}
+
+
 TOOLS = {
     "semantic_search": {
         "schema": {
@@ -78,5 +152,47 @@ TOOLS = {
             },
         },
         "run": _semantic_search,
+    },
+    "browser_use": {
+        "schema": {
+            "name": "browser_use",
+            "description": (
+                "Open a URL in a real browser (browser-use) and capture a screenshot "
+                "plus the visible page text. Best for one-off, ad-hoc browsing — "
+                "'go to this page and grab what's there'."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string", "description": "URL to open"},
+                    "full": {"type": "boolean",
+                             "description": "capture the full scrollable page (default: viewport only)"},
+                },
+                "required": ["url"],
+            },
+        },
+        "run": _browser_use,
+    },
+    "playwright": {
+        "schema": {
+            "name": "playwright",
+            "description": (
+                "Open a URL with Playwright at an EXACT viewport size and capture a "
+                "screenshot plus visible text. Deterministic and repeatable — best "
+                "for specific page sizes and reproducible captures."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string", "description": "URL to open"},
+                    "width": {"type": "integer", "description": "viewport width px (default 1280)"},
+                    "height": {"type": "integer", "description": "viewport height px (default 800)"},
+                    "full": {"type": "boolean",
+                             "description": "capture the full scrollable page (default: viewport only)"},
+                },
+                "required": ["url"],
+            },
+        },
+        "run": _playwright,
     },
 }

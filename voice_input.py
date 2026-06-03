@@ -130,6 +130,8 @@ class VoiceInput:
         self.agent_timeout = agent.get("timeout", 60)
         self.agent_max_tokens = agent.get("max_tokens", 2048)  # required by /v1/messages
         self.agent_max_steps = agent.get("max_steps", 6)       # tool-loop iteration cap
+        self.vision = bool(agent.get("vision", False))         # send tool images to the model
+        self.image_output = bool(agent.get("image_output", True))  # tool images → clipboard
         self.tools_config = tools_config or {}
         self.pipelines = pipelines or {}
         self.context_rules = context_rules or []
@@ -271,18 +273,22 @@ class VoiceInput:
 
             # Optional context-aware transform pipeline. Fail-open: any error
             # returns the best text so far — dictation is never lost.
+            images = []
             if binding.get("pipeline") or self.context_rules:
                 self._set_state("refining")
-                text, pipe = self._refine(text, binding)
+                text, pipe, images = self._refine(text, binding)
                 if pipe:
                     source = f"{source} → {pipe}"
-                if not text.strip():
+                if not text.strip() and not images:
                     print("(empty after pipeline)")
                     return
 
             print(f"-> [{source}] {text}")
-            self._type(text)
-            self._notify(text, source)
+            if text.strip():
+                self._type(text)
+            if images and self.image_output:
+                self._emit_image(images[-1])  # most recent screenshot → clipboard
+            self._notify(text or "(image)", source)
             if source.startswith("⚠"):
                 self._cue("dialog-warning.oga")  # audible degraded-mode cue
         finally:
@@ -409,26 +415,18 @@ class VoiceInput:
         """POST one transform step to the agent endpoint. Prefers the Anthropic
         /v1/messages API (system top-level, max_tokens required); falls back to
         the OpenAI /v1/chat/completions shape when the URL points there. A step
-        with `tools` runs the agentic tool-use loop instead. Returns reply text."""
+        with `tools` runs the agentic tool-use loop instead. Returns
+        (reply_text, image_paths) — images come only from tool-producing steps."""
         import requests
         model, system = step.get("model") or self.agent_model, step["prompt"]
         is_messages = self.agent_url.rstrip("/").endswith("/messages")
         if step.get("tools") and is_messages:
             return self._agent_tool_loop(text, system, model, step["tools"])
         if is_messages:  # Anthropic Messages
-            resp = requests.post(
-                self.agent_url,
-                headers={"Authorization": f"Bearer {self.api_key}",
-                         "anthropic-version": "2023-06-01"},
-                json={"model": model, "max_tokens": self.agent_max_tokens,
-                      "system": system,
-                      "messages": [{"role": "user", "content": text}]},
-                timeout=self.agent_timeout,
-            )
-            resp.raise_for_status()
-            blocks = resp.json().get("content", [])
+            data = self._messages_call(model, system, [{"role": "user", "content": text}])
+            blocks = data.get("content", [])
             return "".join(b.get("text", "") for b in blocks
-                           if b.get("type") == "text").strip()
+                           if b.get("type") == "text").strip(), []
         # OpenAI chat-completions
         resp = requests.post(
             self.agent_url,
@@ -439,18 +437,19 @@ class VoiceInput:
             timeout=self.agent_timeout,
         )
         resp.raise_for_status()
-        return resp.json()["choices"][0]["message"]["content"].strip()
+        return resp.json()["choices"][0]["message"]["content"].strip(), []
 
     def _agent_tool_loop(self, text, system, model, tool_names):
         """Gather-then-synthesize. Phase 1: let the model call tools (tool_choice
-        auto), collecting their results; if it answers directly, use that. Phase 2
-        (on hitting max_steps without an answer): a fresh, TOOL-FREE call that hands
-        the model the findings and asks for prose — search-eager models (minimax)
-        keep searching when tools are present but answer cleanly when they aren't."""
+        auto), collecting their text results AND any images they produce; if it
+        answers directly, use that. Phase 2 (on hitting max_steps without an
+        answer): a fresh, TOOL-FREE call that hands the model the findings and
+        asks for prose — search-eager models (minimax) keep searching when tools
+        are present but answer cleanly when they aren't. Returns (text, images)."""
         from voice_input_tools import TOOLS
         tools = [TOOLS[n]["schema"] for n in tool_names if n in TOOLS]
         messages = [{"role": "user", "content": text}]
-        findings = []
+        findings, images = [], []
         for _ in range(self.agent_max_steps):
             data = self._messages_call(model, system, messages, tools=tools)
             blocks = data.get("content") or []
@@ -458,18 +457,19 @@ class VoiceInput:
                 answer = self._strip_tool_markup(
                     "".join(b.get("text", "") for b in blocks if b.get("type") == "text"))
                 if answer.strip():
-                    return answer.strip()
+                    return answer.strip(), images
                 break  # leaked markup only → fall through to synthesis
             messages.append({"role": "assistant", "content": blocks})
             results = []
             for b in blocks:
                 if b.get("type") == "tool_use":
-                    out = self._run_tool(b.get("name"), b.get("input") or {})
-                    findings.append(f"{b.get('name')}({b.get('input')}):\n{out}")
-                    results.append({"type": "tool_result",
-                                    "tool_use_id": b.get("id"), "content": out})
+                    out_text, out_imgs = self._tool_result(b.get("name"), b.get("input") or {})
+                    images.extend(out_imgs)
+                    findings.append(f"{b.get('name')}({b.get('input')}):\n{out_text}")
+                    results.append({"type": "tool_result", "tool_use_id": b.get("id"),
+                                    "content": self._render_tool_content(out_text, out_imgs)})
             messages.append({"role": "user", "content": results})
-        return self._agent_synthesize(model, system, text, findings)
+        return self._agent_synthesize(model, system, text, findings), images
 
     def _agent_synthesize(self, model, system, question, findings):
         """Fresh tool-free call: write the final answer from gathered findings."""
@@ -508,30 +508,61 @@ class VoiceInput:
         s = re.sub(r"<invoke\b.*?</invoke>", "", s, flags=re.S)
         return s
 
-    def _run_tool(self, name, args):
-        """Execute one local tool by name. Errors come back as text for the model."""
+    def _tool_result(self, name, args):
+        """Run one tool. Returns (text, image_paths). A tool may return a plain
+        string or a dict {text, images}. Errors come back as text for the model."""
         from voice_input_tools import TOOLS
         tool = TOOLS.get(name)
         if not tool:
-            return f"error: unknown tool '{name}'"
+            return f"error: unknown tool '{name}'", []
         print(f"  [tool] {name}({', '.join(f'{k}={v!r}' for k, v in args.items())})")
         try:
-            return tool["run"](args, self)
+            raw = tool["run"](args, self)
         except Exception as e:
-            return f"error running {name}: {e}"
+            return f"error running {name}: {e}", []
+        if isinstance(raw, dict):
+            return str(raw.get("text", "")), [p for p in (raw.get("images") or []) if p]
+        return str(raw), []
+
+    def _render_tool_content(self, text, images):
+        """Build the Anthropic tool_result content. With vision on, attach the
+        images as base64 blocks so a vision model sees them; with vision off (the
+        default — minimax is text-only), send text and just note the image paths."""
+        if images and self.vision:
+            content = [{"type": "text", "text": text}] if text else []
+            for path in images:
+                b64 = self._b64_image(path)
+                if b64:
+                    content.append({"type": "image", "source": {
+                        "type": "base64", "media_type": "image/png", "data": b64}})
+            return content or text
+        if images:  # vision off: keep the text path so a text model still reasons
+            return f"{text}\n[captured image(s): {', '.join(images)}]"
+        return text
+
+    @staticmethod
+    def _b64_image(path):
+        import base64
+        try:
+            with open(path, "rb") as f:
+                return base64.b64encode(f.read()).decode()
+        except OSError:
+            return None
 
     def _refine(self, text, binding):
-        """Chain the selected pipeline's steps. Fail-open: keep best text on error."""
+        """Chain the selected pipeline's steps. Returns (text, name, images) where
+        images are any artifacts tools produced. Fail-open: keep best text on error."""
         name = self._select_pipeline(binding, self._context())
         if not name or name == "raw":
-            return text, None
+            return text, None, []
         steps = self.pipelines.get(name)
         if not steps or not self.agent_url:
-            return text, None  # warning was already printed at startup
-        out = text
+            return text, None, []  # warning was already printed at startup
+        out, images = text, []
         for i, step in enumerate(steps):
             try:
-                new = self._agent_step(out, step)
+                new, imgs = self._agent_step(out, step)
+                images.extend(imgs)
                 if new:
                     out = new
                 else:
@@ -540,7 +571,24 @@ class VoiceInput:
                 print(f"[pipeline '{name}' step {i} failed: {e} — keeping prior]")
                 self._cue("dialog-warning.oga")
                 break
-        return out, name
+        return out, name, images
+
+    def _emit_image(self, path):
+        """Put a tool-produced image on the clipboard so it can be pasted straight
+        into the downstream prompt — the 'pass the image to the output, don't
+        transform it' path. PNG via wl-copy (Wayland) or xclip (X11)."""
+        try:
+            if os.environ.get("WAYLAND_DISPLAY"):
+                with open(path, "rb") as f:
+                    subprocess.run(["wl-copy", "--type", "image/png"],
+                                   stdin=f, check=False)
+            else:
+                subprocess.run(["xclip", "-selection", "clipboard",
+                                "-t", "image/png", "-i", path], check=False)
+            print(f"  [image → clipboard] {path}")
+            self._notify(f"on clipboard: {os.path.basename(path)}", "📷 screenshot")
+        except OSError as e:
+            print(f"[image clipboard failed: {e}]")
 
     # ---- typing + key handlers ----------------------------------------------
 

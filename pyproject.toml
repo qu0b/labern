@@ -16,6 +16,12 @@ dependencies = [
     "tomli>=2.0; python_version < '3.11'",  # py3.11+ has stdlib tomllib
 ]
 
+# Optional: the `playwright` browser tool. `uv sync --extra browser`, then the
+# Chromium browser (`playwright install chromium`). The `browser_use` tool is a
+# separate pipx install (browser-use CLI), not a pip dependency.
+[project.optional-dependencies]
+browser = ["playwright>=1.40"]
+
 # Single-file tool, not an installable package: uv builds a .venv with the
 # dependencies but does not try to build/install labern itself. Run with `uv run`.
 [tool.uv]
