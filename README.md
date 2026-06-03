@@ -127,6 +127,96 @@ cp vocab.example.txt vocab.txt    # vocab.txt is gitignored; one term per line
 last ~223 tokens of the prompt and an over-long prompt hurts quality. (Parakeet
 ignores the vocab.)
 
+### Transform pipeline & context routing (optional)
+
+The transcript can flow through a configurable **pipeline of LLM steps** before
+being typed — to clean grammar, reformat as a chat message, translate, or hand
+off to a tool-using agent. Each step calls an LLM endpoint: the **Anthropic
+Messages API (`/v1/messages`) is preferred**, with OpenAI `/v1/chat/completions`
+also supported (labern picks the request shape from the URL). A *context layer*
+then picks which pipeline runs based on the focused widget (Slack vs. email vs.
+terminal). Without a config file the feature is fully inert and labern behaves
+exactly as before.
+
+```bash
+mkdir -p ~/.config/voice-input
+cp config.example.toml ~/.config/voice-input/config.toml
+# edit ~/.config/voice-input/config.toml to taste
+```
+
+The example config documents every field; the shape is:
+
+```toml
+[stt]                                # remote transcription endpoint (optional;
+url     = "..."                      # else --remote-url/$VOICE_INPUT_REMOTE_URL, or local)
+
+[agent]                              # Anthropic /v1/messages (or OpenAI
+url     = "..."                      # /v1/chat/completions). Reuses ~/.config/voice-input/api_key.
+model   = "minimax-m2.7"
+timeout = 60
+
+[[pipeline.refine]]                  # named pipelines: lists of steps. Each step
+prompt = "Fix grammar."              # POSTs system=prompt, user=running-text;
+                                     # the reply becomes the next step's input.
+
+[[context]]                          # context rules: first match wins; no match
+app  = "slack|mattermost"            # → the binding's default pipeline. Fields
+role = "text"                        # are Python regexes (re.search), matched
+pipeline = "refine"                  # against the focused-widget snapshot.
+```
+
+**Thin-client design.** labern POSTs text and pastes the reply — that's it.
+Tools (web search, code search, file search…) live on the *endpoint* (e.g. a
+Hermes-agent server). The same primitive at a plain LLM endpoint does grammar
+or formatting; at an agent endpoint it does research-and-rewrite. labern itself
+ships no tool-calling loop and no tools.
+
+**Per-key default.** `shift_r` defaults to the `agent` pipeline; `ctrl_r`
+stays raw. Override either by editing `BINDINGS` in `voice_input.py` or by
+writing context rules. The reserved pipeline name `"raw"` disables the pipeline
+for a context.
+
+**Context signal.** A small daemon (`voice_input_context.py`, system Python)
+subscribes to AT-SPI `object:state-changed:focused` events and writes
+`~/.cache/labern/context.json` on every focus change — push-based, ~5–50 ms
+latency, X11 and Wayland. Snapshot fields available to rules:
+
+| Field | Meaning |
+|---|---|
+| `app`    | AT-SPI application name (e.g. `slack`, `gnome-terminal-server`) |
+| `role`   | Focused widget's role (`text`, `terminal`, `push button`, …) |
+| `name`   | Focused widget's accessible name (often the field label) |
+| `window` | Toplevel window's accessible name (usually the window title) |
+
+**Requirement:** AT-SPI must be enabled — `install.sh` sets
+`gsettings set org.gnome.desktop.interface toolkit-accessibility true` for you.
+Without it apps don't emit focus events and rules stay inert (binding defaults
+still run).
+
+**Fail-open everywhere.** Endpoint down, helper crash, malformed step reply,
+no matching rule, AT-SPI bus missing → labern types the best text it has and
+plays a warning cue. Dictation is never lost.
+
+**Per-repo terminal routing (optional).** gnome-terminal's per-tab cwd lives
+inside VTE and isn't published externally. If you want repo-precise routing
+inside a terminal, set the terminal *title* to your `$PWD` (or the git-root
+basename) from your prompt — AT-SPI then surfaces it as the window's
+accessible name, which a context rule can match:
+
+```sh
+# zsh (~/.zshrc):
+precmd() { print -Pn "\e]2;${PWD:t}\a"; }
+# bash (~/.bashrc):
+PROMPT_COMMAND='printf "\e]2;%s\a" "${PWD##*/}"'
+```
+
+Or use a terminal that publishes per-pane cwd as a first-class API —
+`kitty @ ls` or `wezterm cli list --format json` both ship that out of the box.
+
+**Privacy.** The context cache holds only widget identity (app/role/name/window)
+— not text content, not screenshots, not surrounding text. The chat endpoint
+sees only the transcript (plus any system prompts you author).
+
 ### Keybindings
 
 Edit the `BINDINGS` list at the top of `voice_input.py`. Modifier keys
@@ -139,14 +229,18 @@ laptop **Fn key is invisible to software** and cannot be bound.
 ```
 uv run voice_input.py [options]
 
-  -m, --model SIZE      local fallback model (tiny|base|small|medium|large-v3)  [small]
-  -d, --device DEV      cpu | cuda                                              [cpu]
-  -l, --language LANG   force one language on EVERY key (default: per-binding)
-  -p, --initial-prompt  bias decoding toward this text (overrides --vocab)
-      --vocab PATH      glossary file (defaults to vocab.txt next to the script)
-      --remote-url URL  OpenAI-compatible endpoint (or $VOICE_INPUT_REMOTE_URL)
-      --no-remote       force local transcription even if an API key is present
-      --no-tray         run headless, no system-tray icon
+  -m, --model SIZE       local fallback model (tiny|base|small|medium|large-v3) [small]
+  -d, --device DEV       cpu | cuda                                             [cpu]
+  -l, --language LANG    force one language on EVERY key (default: per-binding)
+  -p, --initial-prompt   bias decoding toward this text (overrides --vocab)
+      --vocab PATH       glossary file (defaults to vocab.txt next to the script)
+      --remote-url URL   OpenAI-compatible STT endpoint (or $VOICE_INPUT_REMOTE_URL)
+      --no-remote        force local transcription even if an API key is present
+      --no-tray          run headless, no system-tray icon
+      --config PATH      pipeline+context TOML  [~/.config/voice-input/config.toml]
+      --agent-url URL    override [agent].url (or $VOICE_INPUT_AGENT_URL)
+      --no-pipeline      run every key raw, even with a pipeline configured
+      --no-context-listener   skip the AT-SPI focus listener (context rules inert)
 ```
 
 ## Troubleshooting

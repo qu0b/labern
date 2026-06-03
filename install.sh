@@ -17,12 +17,16 @@ if ! command -v uv >/dev/null; then
 fi
 
 # 2. System deps
+#    AT-SPI bits (python3-gi, gir1.2-atspi-2.0) are used by voice_input_context.py
+#    — labern's focus listener helper that powers context-aware pipeline routing.
 echo "==> installing system packages (requires sudo)"
 sudo apt install -y \
     libportaudio2 \
     xdotool \
     gir1.2-ayatanaappindicator3-0.1 \
-    gnome-shell-extension-appindicator
+    gnome-shell-extension-appindicator \
+    python3-gi \
+    gir1.2-atspi-2.0
 
 # 3. Python environment — uv reads pyproject.toml/uv.lock and builds .venv
 echo "==> syncing Python deps with uv"
@@ -58,6 +62,12 @@ if command -v gnome-extensions >/dev/null; then
     gnome-extensions enable ubuntu-appindicators@ubuntu.com 2>/dev/null || \
     gnome-extensions enable appindicatorsupport@rgcjonas.gmail.com 2>/dev/null || \
     echo "   (install/enable an appindicator extension manually if no icon appears)"
+fi
+
+# 8. Enable AT-SPI globally so apps publish focus events to the a11y bus —
+#    labern's context listener needs this. GNOME ships with it off by default.
+if command -v gsettings >/dev/null; then
+    gsettings set org.gnome.desktop.interface toolkit-accessibility true 2>/dev/null || true
 fi
 
 echo

@@ -30,9 +30,12 @@ Hotkey notes (Linux/X11):
 """
 
 import argparse
+import atexit
 import io
+import json
 import os
 import platform
+import re
 import subprocess
 import sys
 import threading
@@ -43,6 +46,11 @@ import sounddevice as sd
 from faster_whisper import WhisperModel
 from pynput import keyboard
 
+try:
+    import tomllib  # py3.11+
+except ImportError:  # pragma: no cover — py3.9/3.10 fallback
+    import tomli as tomllib
+
 SAMPLE_RATE = 16000
 SOUNDS = "/usr/share/sounds/freedesktop/stereo"
 
@@ -51,8 +59,14 @@ SOUNDS = "/usr/share/sounds/freedesktop/stereo"
 # is pinned to en). Both engines share the remote endpoint + local fallback.
 BINDINGS = [
     {"key": "ctrl_r",  "model": "whisper-large-v3-turbo", "language": None, "label": "whisper"},
-    {"key": "shift_r", "model": "parakeet-tdt-0.6b-v2",   "language": "en", "label": "parakeet"},
+    {"key": "shift_r", "model": "parakeet-tdt-0.6b-v2",   "language": "en", "label": "parakeet",
+     "pipeline": "agent"},
 ]
+
+# Per-dictation context lives here, written by voice_input_context.py.
+CONTEXT_CACHE = os.path.expanduser("~/.cache/labern/context.json")
+CONTEXT_HELPER = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "voice_input_context.py")
 
 
 def _make_icon(color):
@@ -67,9 +81,20 @@ def _make_icon(color):
     return img
 
 
+def _preexec_pdeath():
+    """Linux: ask the kernel to SIGTERM us when our parent dies. Best-effort."""
+    try:
+        import ctypes
+        ctypes.CDLL("libc.so.6", use_errno=True).prctl(1, 15)  # PR_SET_PDEATHSIG, SIGTERM
+    except (OSError, AttributeError):
+        pass
+
+
 class VoiceInput:
     def __init__(self, bindings, model_size, device, use_tray, initial_prompt,
-                 remote_url=None, api_key=None):
+                 remote_url=None, api_key=None,
+                 agent=None, pipelines=None, context_rules=None,
+                 run_context_listener=True):
         self.use_tray = use_tray
         self.initial_prompt = initial_prompt
         self.recording = False
@@ -97,8 +122,25 @@ class VoiceInput:
         self._compute = "int8" if device == "cpu" else "float16"
         self.model = None
 
+        # Transform-pipeline + context-routing state. All optional; absent config
+        # → feature inert and behavior matches pre-pipeline labern exactly.
+        agent = agent or {}
+        self.agent_url = agent.get("url")
+        self.agent_model = agent.get("model")
+        self.agent_timeout = agent.get("timeout", 60)
+        self.agent_max_tokens = agent.get("max_tokens", 2048)  # required by /v1/messages
+        self.pipelines = pipelines or {}
+        self.context_rules = context_rules or []
+        self._compiled_rules = self._compile_context_rules(self.context_rules)
+        self._ctx_proc = None
+        self._warn_pipeline_misconfig()
+
         if not self.use_remote:
             self._ensure_local_model()
+
+        if run_context_listener and (self.context_rules or any(
+                b.get("pipeline") for b in self.bindings)):
+            self._start_context_listener()
 
         if self.initial_prompt:
             print(f"vocab bias: {self.initial_prompt.count(',') + 1} terms")
@@ -225,6 +267,17 @@ class VoiceInput:
                 print("(no speech)")
                 return
 
+            # Optional context-aware transform pipeline. Fail-open: any error
+            # returns the best text so far — dictation is never lost.
+            if binding.get("pipeline") or self.context_rules:
+                self._set_state("refining")
+                text, pipe = self._refine(text, binding)
+                if pipe:
+                    source = f"{source} → {pipe}"
+                if not text.strip():
+                    print("(empty after pipeline)")
+                    return
+
             print(f"-> [{source}] {text}")
             self._type(text)
             self._notify(text, source)
@@ -269,6 +322,137 @@ class VoiceInput:
         resp.raise_for_status()
         return resp.json().get("text", "")
 
+    # ---- transform pipeline + context routing -------------------------------
+
+    def _warn_pipeline_misconfig(self):
+        """Surface common config gotchas at startup, but never crash."""
+        referenced = {b.get("pipeline") for b in self.bindings if b.get("pipeline")}
+        referenced |= {r.get("pipeline") for r in self.context_rules if r.get("pipeline")}
+        referenced -= {None, "raw"}
+        missing = referenced - set(self.pipelines)
+        if missing:
+            print(f"[warn: pipelines referenced but not defined: "
+                  f"{sorted(missing)} — those keys will run raw]")
+        if (referenced - missing) and not self.agent_url:
+            print("[warn: pipelines configured but agent.url is unset — "
+                  "all pipelines will be skipped (raw transcript typed)]")
+
+    def _start_context_listener(self):
+        """Spawn the AT-SPI focus listener. Fail-open: cache stays empty on error."""
+        if not os.path.exists(CONTEXT_HELPER):
+            print(f"[context listener: {CONTEXT_HELPER} not found — rules inert]")
+            return
+        try:
+            self._ctx_proc = subprocess.Popen(
+                ["/usr/bin/python3", CONTEXT_HELPER],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                preexec_fn=(_preexec_pdeath if platform.system() == "Linux" else None),
+            )
+            atexit.register(self._stop_context_listener)
+        except OSError as e:
+            print(f"[context listener spawn failed: {e} — rules inert]")
+
+    def _stop_context_listener(self):
+        p = self._ctx_proc
+        if p is None or p.poll() is not None:
+            return
+        try:
+            p.terminate()
+            p.wait(timeout=1)
+        except (OSError, subprocess.TimeoutExpired):
+            try:
+                p.kill()
+            except OSError:
+                pass
+
+    def _context(self):
+        """Read the focused-widget snapshot. {} on any failure (fail-open)."""
+        try:
+            with open(CONTEXT_CACHE) as f:
+                return json.load(f)
+        except (OSError, ValueError):
+            return {}
+
+    @staticmethod
+    def _compile_context_rules(rules):
+        """Pre-compile rule regexes so bad patterns fail fast at startup, not mid-dictation."""
+        compiled = []
+        for i, rule in enumerate(rules):
+            matchers = []
+            for field, pat in rule.items():
+                if field == "pipeline":
+                    continue
+                try:
+                    matchers.append((field, re.compile(pat)))
+                except (re.error, TypeError) as e:
+                    raise SystemExit(f"bad context rule #{i} field '{field}': {e}")
+            compiled.append((matchers, rule.get("pipeline")))
+        return compiled
+
+    def _select_pipeline(self, binding, ctx):
+        """First context rule whose every regex matches ctx wins; else binding default."""
+        for matchers, pipeline in self._compiled_rules:
+            if all(rx.search(ctx.get(field, "") or "") for field, rx in matchers):
+                return pipeline
+        return binding.get("pipeline")
+
+    def _agent_step(self, text, step):
+        """POST one transform step to the agent endpoint. Prefers the Anthropic
+        /v1/messages API (system top-level, max_tokens required); falls back to
+        the OpenAI /v1/chat/completions shape when the URL points there. Returns
+        the model's reply text."""
+        import requests
+        model, system = step.get("model") or self.agent_model, step["prompt"]
+        if self.agent_url.rstrip("/").endswith("/messages"):  # Anthropic Messages
+            resp = requests.post(
+                self.agent_url,
+                headers={"Authorization": f"Bearer {self.api_key}",
+                         "anthropic-version": "2023-06-01"},
+                json={"model": model, "max_tokens": self.agent_max_tokens,
+                      "system": system,
+                      "messages": [{"role": "user", "content": text}]},
+                timeout=self.agent_timeout,
+            )
+            resp.raise_for_status()
+            blocks = resp.json().get("content", [])
+            return "".join(b.get("text", "") for b in blocks
+                           if b.get("type") == "text").strip()
+        # OpenAI chat-completions
+        resp = requests.post(
+            self.agent_url,
+            headers={"Authorization": f"Bearer {self.api_key}"},
+            json={"model": model,
+                  "messages": [{"role": "system", "content": system},
+                               {"role": "user", "content": text}]},
+            timeout=self.agent_timeout,
+        )
+        resp.raise_for_status()
+        return resp.json()["choices"][0]["message"]["content"].strip()
+
+    def _refine(self, text, binding):
+        """Chain the selected pipeline's steps. Fail-open: keep best text on error."""
+        name = self._select_pipeline(binding, self._context())
+        if not name or name == "raw":
+            return text, None
+        steps = self.pipelines.get(name)
+        if not steps or not self.agent_url:
+            return text, None  # warning was already printed at startup
+        out = text
+        for i, step in enumerate(steps):
+            try:
+                new = self._agent_step(out, step)
+                if new:
+                    out = new
+                else:
+                    print(f"[pipeline '{name}' step {i} returned empty — keeping prior]")
+            except Exception as e:
+                print(f"[pipeline '{name}' step {i} failed: {e} — keeping prior]")
+                self._cue("dialog-warning.oga")
+                break
+        return out, name
+
+    # ---- typing + key handlers ----------------------------------------------
+
     @staticmethod
     def _type(text):
         if platform.system() == "Darwin":
@@ -295,6 +479,7 @@ class VoiceInput:
             self._stop()
 
     def _quit(self, icon=None, item=None):
+        self._stop_context_listener()
         if self.tray:
             self.tray.stop()
         os._exit(0)
@@ -314,6 +499,7 @@ class VoiceInput:
             "idle": _make_icon("#aaaaaa"),
             "recording": _make_icon("#e53935"),
             "busy": _make_icon("#fb8c00"),
+            "refining": _make_icon("#3949ab"),
         }
         keys = " · ".join(f"[{b['key']}]={b['label']}" for b in self.bindings)
         menu = pystray.Menu(
@@ -338,6 +524,17 @@ def _load_vocab(path):
     return ", ".join(terms) if terms else None
 
 
+def _load_config(path):
+    """Parse the optional TOML config. Missing → {}; malformed → SystemExit (fail-fast)."""
+    try:
+        with open(path, "rb") as f:
+            return tomllib.load(f)
+    except FileNotFoundError:
+        return {}
+    except (OSError, tomllib.TOMLDecodeError) as e:
+        raise SystemExit(f"bad config {path}: {e}")
+
+
 def main():
     p = argparse.ArgumentParser(description="Push-to-talk voice input (two engines on two keys)")
     p.add_argument("-m", "--model", default="small",
@@ -352,11 +549,22 @@ def main():
     p.add_argument("--remote-url",
                    default=os.environ.get("VOICE_INPUT_REMOTE_URL"),
                    help="OpenAI-compatible /v1/audio/transcriptions endpoint "
-                        "(or set $VOICE_INPUT_REMOTE_URL). Unset = local model only.")
+                        "(or set $VOICE_INPUT_REMOTE_URL, or [stt].url in --config). "
+                        "Unset = local model only.")
     p.add_argument("--no-remote", action="store_true",
                    help="force local transcription even if an API key is available")
     p.add_argument("--no-tray", dest="tray", action="store_false",
                    help="disable system tray icon")
+    p.add_argument("--config",
+                   default=os.path.expanduser("~/.config/voice-input/config.toml"),
+                   help="TOML config: [stt], [agent], [[pipeline.*]], [[context]] tables")
+    p.add_argument("--agent-url",
+                   default=os.environ.get("VOICE_INPUT_AGENT_URL"),
+                   help="override [agent].url (OpenAI-compatible /v1/chat/completions)")
+    p.add_argument("--no-pipeline", action="store_true",
+                   help="run every key raw, even if a pipeline is configured (debug)")
+    p.add_argument("--no-context-listener", action="store_true",
+                   help="skip the AT-SPI focus-listener subprocess (debug)")
     args = p.parse_args()
 
     prompt = args.initial_prompt
@@ -365,7 +573,7 @@ def main():
             os.path.dirname(os.path.abspath(__file__)), "vocab.txt")
         prompt = _load_vocab(vocab_path)
 
-    # API key for the remote endpoint: env wins, else the key file.
+    # API key: env wins, else the key file. Reused for STT, TTS, and chat endpoints.
     api_key = os.environ.get("VOICE_INPUT_API_KEY")
     if not api_key:
         try:
@@ -373,15 +581,33 @@ def main():
                 api_key = f.read().strip()
         except OSError:
             api_key = None
-    remote_url = None if args.no_remote else args.remote_url
+
+    config = _load_config(args.config)
+
+    # STT endpoint precedence: --remote-url / $VOICE_INPUT_REMOTE_URL > [stt].url in config.
+    remote_url = args.remote_url or (config.get("stt") or {}).get("url")
+    if args.no_remote:
+        remote_url = None
 
     bindings = [dict(b) for b in BINDINGS]
     if args.language:  # global override across all keys
         for b in bindings:
             b["language"] = args.language
 
+    agent = dict(config.get("agent") or {})
+    if args.agent_url:
+        agent["url"] = args.agent_url
+    pipelines = config.get("pipeline") or {}        # {name: [step, ...]}
+    context_rules = config.get("context") or []    # [{field: regex, ..., pipeline: name}, ...]
+    if args.no_pipeline:                            # debug escape hatch
+        for b in bindings:
+            b.pop("pipeline", None)
+        context_rules = []
+
     VoiceInput(bindings, args.model, args.device, args.tray,
-               prompt, remote_url, api_key).run()
+               prompt, remote_url, api_key,
+               agent=agent, pipelines=pipelines, context_rules=context_rules,
+               run_context_listener=not args.no_context_listener).run()
 
 
 if __name__ == "__main__":

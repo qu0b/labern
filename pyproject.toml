@@ -13,6 +13,7 @@ dependencies = [
     "pystray>=0.19.5",
     "Pillow>=10.0.0",
     "requests>=2.28.0",
+    "tomli>=2.0; python_version < '3.11'",  # py3.11+ has stdlib tomllib
 ]
 
 # Single-file tool, not an installable package: uv builds a .venv with the

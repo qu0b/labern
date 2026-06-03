@@ -1,0 +1,116 @@
+# Example labern config. Copy to ~/.config/voice-input/config.toml and edit:
+#
+#     mkdir -p ~/.config/voice-input
+#     cp config.example.toml ~/.config/voice-input/config.toml
+#
+# Adds two layers on top of the raw transcription that ctrl_r/shift_r produce:
+#
+#   1. A transform pipeline: one or more chat-completions calls that rewrite the
+#      transcript before it is typed at the cursor. A pipeline pointed at a
+#      plain chat endpoint does grammar/format passes; a pipeline pointed at a
+#      Hermes-style agent endpoint (tools wired in server-side) does
+#      research/code-search/etc. and returns the final text. labern is the thin
+#      client — tools live on the endpoint, not in labern.
+#
+#   2. Context routing: pick a pipeline based on the focused widget. labern's
+#      AT-SPI listener writes ~/.cache/labern/context.json on every focus change
+#      (push-based, ~5–50 ms latency). The rules below match on its fields with
+#      regex. First match wins; no match → the binding's default pipeline.
+#
+# Failure modes are all fail-open: endpoint down, helper crash, empty reply,
+# malformed rule → fall back to the next-best text. Dictation is never lost.
+# Reuse the existing ~/.config/voice-input/api_key (same key for STT + chat).
+
+
+# ── speech-to-text endpoint ──────────────────────────────────────────────────
+[stt]
+# Remote transcription endpoint (OpenAI-compatible /v1/audio/transcriptions).
+# Per-key engine model names live in BINDINGS in voice_input.py. Falls back to a
+# local whisper model if unreachable. Omit this section to run local-only.
+# --remote-url / $VOICE_INPUT_REMOTE_URL override it.
+url = "http://localhost:8080/v1/audio/transcriptions"
+
+
+# ── chat / agent endpoint ────────────────────────────────────────────────────
+[agent]
+# Prefers the Anthropic Messages API (/v1/messages); also accepts an OpenAI
+# /v1/chat/completions URL — labern picks the request shape from the URL path.
+# A plain LLM endpoint handles grammar/format prompts; a tool-equipped agent
+# endpoint makes the same primitive a full research-and-rewrite agent.
+url        = "http://localhost:8080/v1/messages"
+model      = "minimax-m2.7"   # default model for steps that don't override it
+timeout    = 60               # seconds per step
+max_tokens = 2048             # required by /v1/messages; ignored by chat-completions
+
+
+# ── named pipelines ──────────────────────────────────────────────────────────
+# Each pipeline is an ordered list of steps; each step's reply replaces the
+# running text, then feeds the next step. A reserved pipeline name "raw"
+# disables transformation for a context.
+
+[[pipeline.refine]]
+prompt = """
+Fix spelling, grammar, and punctuation in the user's dictated text.
+Output ONLY the corrected text — no preamble, no quotes, no explanation.
+"""
+
+[[pipeline.agent]]
+# model = "minimax-m2.7"   # optional per-step override of [agent].model
+prompt = """
+You are a dictation assistant with tools (web search, code search, file
+search, etc.). Use them as needed to carry out the user's spoken request,
+then output ONLY the final text to insert at the user's cursor — nothing
+else, no preamble.
+"""
+
+[[pipeline.chat]]
+prompt = """
+Rewrite the user's dictation into a polished chat message: natural tone,
+correct spelling and grammar, no formal greeting/sign-off. Output ONLY the
+final message.
+"""
+
+
+# ── context routing ─────────────────────────────────────────────────────────
+# Each [[context]] rule's fields are case-sensitive Python regexes evaluated
+# with re.search against the corresponding snapshot field. First rule whose
+# every specified field matches wins; otherwise the focused-key binding's
+# default pipeline runs (shift_r defaults to "agent"). Snapshot fields:
+#
+#   app    — the AT-SPI application name (e.g. "slack", "gnome-terminal-server")
+#   role   — the focused widget's role ("text", "terminal", "push button", …)
+#   name   — the focused widget's accessible name (often the field label)
+#   window — the toplevel window's accessible name (usually the window title)
+
+[[context]]
+app  = "slack|mattermost|Discord"
+role = "text"
+name = "Message |Compose"
+pipeline = "chat"
+
+[[context]]
+app    = "gnome-terminal-server"
+window = "labern"   # works if your shell sets the terminal title to $PWD/repo
+pipeline = "agent"
+
+[[context]]
+app  = "Evolution"
+name = "Subject"
+pipeline = "agent"
+
+
+# ── optional: cooperative cwd reporting for terminals ────────────────────────
+# Per-tab cwd is not externally readable from gnome-terminal-server — VTE owns
+# it via OSC 7 but never publishes it. If you want repo-precise routing inside
+# a terminal, set your prompt to put $PWD (or the git root basename) in the
+# *terminal title* via an OSC 0 escape. AT-SPI then surfaces it as the window
+# accessible name, which the `window` field above matches against.
+#
+# zsh (~/.zshrc):
+#     precmd() { print -Pn "\e]2;${${${PWD:t}//\~/HOME}}\a"; }
+#
+# bash (~/.bashrc):
+#     PROMPT_COMMAND='printf "\e]2;%s\a" "${PWD##*/}"'
+#
+# Or use kitty/WezTerm, which expose per-pane cwd as a first-class API
+# (`kitty @ ls`, `wezterm cli list --format json`).
