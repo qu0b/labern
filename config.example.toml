@@ -66,7 +66,10 @@ image_output = true             # screenshots produced by tools are copied to th
 #   playwright       — deterministic screenshot at an exact viewport size (`browser` extra)
 #   shell            — run ONE allowlisted, read-only command (no shell operators)
 [tools]
-root = "."                       # default root for search/file/code tools
+root = "."                       # fallback root for search/file/code tools
+projects_dir = "~/repos"         # labern scopes code tools to the repo you're in:
+                                 # if a folder name under here appears in the focused
+                                 # window title, that repo becomes the tool root
 # exa_api_key = "exa-..."        # for exa_search / exa_contents (or $EXA_API_KEY)
 # shell_allow = ["git","ls","cat","rg","grep"]   # override the shell allowlist
 
@@ -113,6 +116,8 @@ final message.
 #   name   — the focused widget's accessible name (often the field label)
 #   window — the toplevel window's accessible name (usually the window title)
 
+# A rule may also set `root` to force the tool search path for a matching window
+# (e.g. pin a specific app/title to a repo when the title doesn't name it).
 [[context]]
 app  = "slack|mattermost|Discord"
 role = "text"
