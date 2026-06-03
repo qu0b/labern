@@ -1,29 +1,31 @@
 #!/usr/bin/env python3
-"""AT-SPI focus-change listener for labern.
+"""AT-SPI focused-widget snapshot for labern (pull-based).
 
-Subscribes once to ``object:state-changed:focused`` events on the session
-accessibility bus. On each event, atomically writes a JSON snapshot of the
-focused widget to ~/.cache/labern/context.json. The main labern process reads
-that file at dictation time to pick a context-appropriate transform pipeline.
+Run once, prints a JSON snapshot of the currently-focused widget to stdout, and
+exits:
 
-Runs as a daemon spawned by labern with the system /usr/bin/python3 so it can
-import gi.repository.Atspi (the labern uv venv intentionally has no gi).
-Fail-open: any error → cache stays as-is; labern uses pipeline defaults.
+    /usr/bin/python3 voice_input_context.py --once
+    {"app": "Code", "role": "text", "name": "...", "window": "labern - Code"}
 
-Needs `gsettings set org.gnome.desktop.interface toolkit-accessibility true`
-or focus events will not be emitted on GNOME.
+labern spawns this at dictation time (when a transform pipeline runs) to pick a
+context-appropriate pipeline and project root. It is invoked on demand rather
+than run as a standing listener, so the desktop pays no continuous accessibility
+IPC cost — only one quick scan per dictation.
+
+Runs under the system /usr/bin/python3 so it can import gi.repository.Atspi (the
+labern uv venv intentionally has no gi). Fail-open: any error → prints `{}` and
+labern falls back to its pipeline defaults.
+
+Needs `gsettings set org.gnome.desktop.interface toolkit-accessibility true` so
+the a11y bus exposes the focused widget.
 """
 
 import json
-import os
 import sys
-import tempfile
 
 import gi
 gi.require_version("Atspi", "2.0")
 from gi.repository import Atspi  # noqa: E402
-
-CACHE = os.path.expanduser("~/.cache/labern/context.json")
 
 # Roles that represent a toplevel container we'd call "the window".
 _WINDOW_ROLES = (Atspi.Role.FRAME, Atspi.Role.WINDOW, Atspi.Role.DIALOG)
@@ -59,22 +61,10 @@ def _snapshot(obj):
         return {}
 
 
-def _write(d):
-    """Atomic write: tmp file in the same dir, then rename. Silent on failure."""
-    try:
-        os.makedirs(os.path.dirname(CACHE), exist_ok=True)
-        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(CACHE), prefix=".ctx.")
-        try:
-            os.write(fd, json.dumps(d).encode())
-        finally:
-            os.close(fd)
-        os.rename(tmp, CACHE)
-    except OSError as e:
-        print(f"labern-context: write failed: {e}", file=sys.stderr)
-
-
-def _seed_initial():
-    """Find the currently-focused widget and seed the cache once at startup."""
+def snapshot_focused():
+    """Scan the active window for the focused widget and return its snapshot dict
+    ({} if none found). One pass over the active app's window subtree — the
+    pull-based replacement for subscribing to every global focus change."""
     try:
         desktop = Atspi.get_desktop(0)
         for i in range(desktop.get_child_count()):
@@ -96,35 +86,26 @@ def _seed_initial():
                     node = stack.pop()
                     try:
                         if node.get_state_set().contains(Atspi.StateType.FOCUSED):
-                            _write(_snapshot(node))
-                            return
+                            return _snapshot(node)
                         for k in range(node.get_child_count()):
                             child = node.get_child_at_index(k)
                             if child is not None:
                                 stack.append(child)
                     except Exception:
                         pass
-                _write(_snapshot(win))
-                return
+                return _snapshot(win)
     except Exception as e:
-        print(f"labern-context: initial scan failed: {e}", file=sys.stderr)
-
-
-def _on_focus(event):
-    # detail1 == 1 → focus gained; 0 → lost. Only act on gain.
-    if event.detail1:
-        _write(_snapshot(event.source))
+        print(f"labern-context: scan failed: {e}", file=sys.stderr)
+    return {}
 
 
 def main():
+    # Single-shot: print one snapshot as JSON and exit. The `--once` flag is
+    # accepted for explicitness but this is the only mode.
     if Atspi.init() != 0:
-        print("labern-context: Atspi.init() failed; is the a11y bus running?",
-              file=sys.stderr)
+        print("{}")  # a11y bus unavailable → fail-open, labern uses defaults
         return
-    _seed_initial()
-    listener = Atspi.EventListener.new(_on_focus)
-    listener.register("object:state-changed:focused")
-    Atspi.event_main()  # blocks; SIGTERM unblocks cleanly
+    print(json.dumps(snapshot_focused()))
 
 
 if __name__ == "__main__":

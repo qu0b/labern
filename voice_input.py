@@ -30,7 +30,6 @@ Hotkey notes (Linux/X11):
 """
 
 import argparse
-import atexit
 import io
 import json
 import os
@@ -63,8 +62,7 @@ BINDINGS = [
      "pipeline": "agent"},
 ]
 
-# Per-dictation context lives here, written by voice_input_context.py.
-CONTEXT_CACHE = os.path.expanduser("~/.cache/labern/context.json")
+# The AT-SPI helper that snapshots the focused widget; run on demand per dictation.
 CONTEXT_HELPER = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "voice_input_context.py")
 
@@ -81,18 +79,24 @@ def _make_icon(color):
     return img
 
 
-def _preexec_pdeath():
-    """Linux: ask the kernel to SIGTERM us when our parent dies. Best-effort."""
-    try:
-        import ctypes
-        ctypes.CDLL("libc.so.6", use_errno=True).prctl(1, 15)  # PR_SET_PDEATHSIG, SIGTERM
-    except (OSError, AttributeError):
-        pass
+_SESSION = None
+
+
+def _http():
+    """Process-wide requests.Session: keep-alive reuses one TCP+TLS connection
+    across STT and the up-to-max_steps agent round-trips instead of handshaking
+    afresh every call. Lazily built so importing this module stays cheap."""
+    global _SESSION
+    if _SESSION is None:
+        import requests
+        _SESSION = requests.Session()
+    return _SESSION
 
 
 class VoiceInput:
     def __init__(self, bindings, model_size, device, use_tray, initial_prompt,
-                 remote_url=None, api_key=None,
+                 remote_url=None, api_key=None, local_beam_size=1,
+                 local_cpu_threads=None,
                  agent=None, pipelines=None, context_rules=None, tools_config=None,
                  run_context_listener=True):
         self.use_tray = use_tray
@@ -120,6 +124,11 @@ class VoiceInput:
         self._model_size = model_size
         self._device = device
         self._compute = "int8" if device == "cpu" else "float16"
+        self._beam_size = max(1, local_beam_size)  # greedy by default: ~3x faster on CPU
+        # Cap CPU inference threads so a local-fallback transcription can't pin
+        # every core and freeze the desktop. Default: leave half the machine free.
+        self._cpu_threads = (local_cpu_threads if local_cpu_threads is not None
+                             else max(1, (os.cpu_count() or 4) // 2))
         self.model = None
 
         # Transform-pipeline + context-routing state. All optional; absent config
@@ -139,15 +148,13 @@ class VoiceInput:
         self.pipelines = pipelines or {}
         self.context_rules = context_rules or []
         self._compiled_rules = self._compile_context_rules(self.context_rules)
-        self._ctx_proc = None
+        # Context is captured on demand at dictation time (see _context), not via a
+        # standing AT-SPI listener — keeps the desktop free of continuous a11y IPC.
+        self._consult_context = run_context_listener
         self._warn_pipeline_misconfig()
 
         if not self.use_remote:
             self._ensure_local_model()
-
-        if run_context_listener and (self.context_rules or any(
-                b.get("pipeline") for b in self.bindings)):
-            self._start_context_listener()
 
         if self.initial_prompt:
             print(f"vocab bias: {self.initial_prompt.count(',') + 1} terms")
@@ -250,9 +257,11 @@ class VoiceInput:
 
     def _ensure_local_model(self):
         if self.model is None:
-            print(f"loading whisper '{self._model_size}' on {self._device}...")
+            print(f"loading whisper '{self._model_size}' on {self._device} "
+                  f"({self._cpu_threads} threads)...")
             self.model = WhisperModel(
-                self._model_size, device=self._device, compute_type=self._compute)
+                self._model_size, device=self._device, compute_type=self._compute,
+                cpu_threads=self._cpu_threads)
 
     def _transcribe(self, audio, binding):
         try:
@@ -300,7 +309,7 @@ class VoiceInput:
     def _transcribe_local(self, audio, language):
         self._ensure_local_model()
         audio_f32 = audio.astype(np.float32) / 32768.0
-        opts = {"beam_size": 5}
+        opts = {"beam_size": self._beam_size}
         if language:
             opts["language"] = language
         if self.initial_prompt:
@@ -310,7 +319,6 @@ class VoiceInput:
 
     def _transcribe_remote(self, audio, model, language):
         """POST the clip to an OpenAI-compatible /v1/audio/transcriptions endpoint."""
-        import requests
         buf = io.BytesIO()
         with wave.open(buf, "wb") as w:
             w.setnchannels(1)
@@ -323,7 +331,7 @@ class VoiceInput:
             data["language"] = language
         if self.initial_prompt:
             data["prompt"] = self.initial_prompt  # OpenAI's term-bias field
-        resp = requests.post(
+        resp = _http().post(
             self.remote_url,
             headers={"Authorization": f"Bearer {self.api_key}"},
             files={"file": ("audio.wav", buf, "audio/wav")},
@@ -355,40 +363,23 @@ class VoiceInput:
             print(f"[warn: pipeline steps reference unknown tools {sorted(unknown)} "
                   f"— available: {sorted(TOOLS)}]")
 
-    def _start_context_listener(self):
-        """Spawn the AT-SPI focus listener. Fail-open: cache stays empty on error."""
-        if not os.path.exists(CONTEXT_HELPER):
-            print(f"[context listener: {CONTEXT_HELPER} not found — rules inert]")
-            return
-        try:
-            self._ctx_proc = subprocess.Popen(
-                ["/usr/bin/python3", CONTEXT_HELPER],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                preexec_fn=(_preexec_pdeath if platform.system() == "Linux" else None),
-            )
-            atexit.register(self._stop_context_listener)
-        except OSError as e:
-            print(f"[context listener spawn failed: {e} — rules inert]")
-
-    def _stop_context_listener(self):
-        p = self._ctx_proc
-        if p is None or p.poll() is not None:
-            return
-        try:
-            p.terminate()
-            p.wait(timeout=1)
-        except (OSError, subprocess.TimeoutExpired):
-            try:
-                p.kill()
-            except OSError:
-                pass
-
     def _context(self):
-        """Read the focused-widget snapshot. {} on any failure (fail-open)."""
+        """Snapshot the focused widget on demand: spawn the AT-SPI helper for a
+        single reading at dictation time (pull-based — no standing listener taxing
+        the desktop). {} when disabled or on any failure (fail-open)."""
+        if not self._consult_context or not os.path.exists(CONTEXT_HELPER):
+            return {}
         try:
-            with open(CONTEXT_CACHE) as f:
-                return json.load(f)
-        except (OSError, ValueError):
+            proc = subprocess.run(
+                ["/usr/bin/python3", CONTEXT_HELPER, "--once"],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                timeout=2.0,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return {}
+        try:
+            return json.loads(proc.stdout or b"{}") or {}
+        except ValueError:
             return {}
 
     @staticmethod
@@ -459,7 +450,6 @@ class VoiceInput:
         with `tools` runs the agentic tool-use loop instead. ctx_note (app/window/
         repo) is appended to the system prompt of tool steps so the agent knows
         where it is. Returns (reply_text, image_paths)."""
-        import requests
         model, system = step.get("model") or self.agent_model, step["prompt"]
         if ctx_note and step.get("tools"):  # situational awareness for agent steps
             system = f"{system}\n\n{ctx_note}"
@@ -472,7 +462,7 @@ class VoiceInput:
             return "".join(b.get("text", "") for b in blocks
                            if b.get("type") == "text").strip(), []
         # OpenAI chat-completions
-        resp = requests.post(
+        resp = _http().post(
             self.agent_url,
             headers={"Authorization": f"Bearer {self.api_key}"},
             json={"model": model,
@@ -531,12 +521,11 @@ class VoiceInput:
 
     def _messages_call(self, model, system, messages, tools=None):
         """One Anthropic /v1/messages POST; returns the parsed JSON."""
-        import requests
         payload = {"model": model, "max_tokens": self.agent_max_tokens,
                    "system": system, "messages": messages}
         if tools:
             payload["tools"] = tools
-        resp = requests.post(
+        resp = _http().post(
             self.agent_url,
             headers={"Authorization": f"Bearer {self.api_key}",
                      "anthropic-version": "2023-06-01"},
@@ -668,7 +657,6 @@ class VoiceInput:
             self._stop()
 
     def _quit(self, icon=None, item=None):
-        self._stop_context_listener()
         if self.tray:
             self.tray.stop()
         os._exit(0)
@@ -774,9 +762,19 @@ def main():
     config = _load_config(args.config)
 
     # STT endpoint precedence: --remote-url / $VOICE_INPUT_REMOTE_URL > [stt].url in config.
-    remote_url = args.remote_url or (config.get("stt") or {}).get("url")
+    stt = config.get("stt") or {}
+    remote_url = args.remote_url or stt.get("url")
     if args.no_remote:
         remote_url = None
+    try:
+        local_beam_size = int(stt.get("beam_size", 1))  # local-fallback decode width
+    except (TypeError, ValueError):
+        local_beam_size = 1
+    try:
+        local_cpu_threads = stt.get("cpu_threads")  # None → half the cores (headroom)
+        local_cpu_threads = int(local_cpu_threads) if local_cpu_threads is not None else None
+    except (TypeError, ValueError):
+        local_cpu_threads = None
 
     bindings = [dict(b) for b in BINDINGS]
     if args.language:  # global override across all keys
@@ -795,7 +793,7 @@ def main():
         context_rules = []
 
     VoiceInput(bindings, args.model, args.device, args.tray,
-               prompt, remote_url, api_key,
+               prompt, remote_url, api_key, local_beam_size, local_cpu_threads,
                agent=agent, pipelines=pipelines, context_rules=context_rules,
                tools_config=tools_config,
                run_context_listener=not args.no_context_listener).run()
