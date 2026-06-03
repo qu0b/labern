@@ -164,7 +164,7 @@ class VoiceInput:
     def _set_state(self, state):
         if self.tray and state in self._icons:
             self.tray.icon = self._icons[state]
-            self.tray.title = f"voice-input — {state}"
+            self.tray.title = f"voice-input - {state}"
 
     @staticmethod
     def _cue(fname):
@@ -648,7 +648,7 @@ class VoiceInput:
         )
         self.tray = pystray.Icon(
             "voice-input", self._icons["idle"],
-            "voice-input — idle", menu=menu,
+            "voice-input - idle", menu=menu,
         )
         self.tray.run()
 
