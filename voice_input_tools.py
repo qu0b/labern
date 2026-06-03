@@ -196,3 +196,16 @@ TOOLS = {
         "run": _playwright,
     },
 }
+
+# Aggregate optional tool modules (each is a self-contained tools_*.py exposing
+# its own TOOLS dict). A module whose backend/dep is missing fails to import and
+# is simply skipped — it disables only its own tools, never the core registry.
+import importlib  # noqa: E402
+
+for _mod in ("tools_files", "tools_treesitter", "tools_lsp",
+             "tools_web", "tools_shell", "tools_explore"):
+    try:
+        TOOLS.update(getattr(importlib.import_module(_mod), "TOOLS", {}))
+    except Exception as _e:  # missing optional dep, import error, etc.
+        import sys
+        print(f"[tools: {_mod} unavailable — {_e}]", file=sys.stderr)

@@ -16,11 +16,22 @@ dependencies = [
     "tomli>=2.0; python_version < '3.11'",  # py3.11+ has stdlib tomllib
 ]
 
-# Optional: the `playwright` browser tool. `uv sync --extra browser`, then the
-# Chromium browser (`playwright install chromium`). The `browser_use` tool is a
-# separate pipx install (browser-use CLI), not a pip dependency.
+# Optional tool dependencies — install per tool group, e.g. `uv sync --extra code`.
+# Tools degrade to a clear "not installed" error when their backend is absent.
+#   browser : the `playwright` tool (+ `playwright install chromium`). The
+#             `browser_use` tool is a separate pipx install, not a pip dep.
+#   code    : the `tree_sitter` and `lsp` tools (pyflakes/pycodestyle give pylsp
+#             real diagnostics). `semantic_search` needs the external `colgrep`.
+# file_list/tree/read_file/shell are stdlib; exa_search/exa_contents use requests.
 [project.optional-dependencies]
 browser = ["playwright>=1.40"]
+code = [
+    "tree-sitter>=0.21",
+    "tree-sitter-language-pack>=1.0; python_version >= '3.10'",  # pack needs 3.10+
+    "python-lsp-server>=1.9",
+    "pyflakes>=3.0",
+    "pycodestyle>=2.11",
+]
 
 # Single-file tool, not an installable package: uv builds a .venv with the
 # dependencies but does not try to build/install labern itself. Run with `uv run`.

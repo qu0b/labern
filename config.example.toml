@@ -53,12 +53,22 @@ image_output = true             # screenshots produced by tools are copied to th
 # Tools the agent can call, executed on THIS machine via the Anthropic tool-use
 # loop (the model requests a tool, labern runs it, feeds the result back). A
 # pipeline step opts in with `tools = [...]` (see [[pipeline.agent]] below).
-# Registered in voice_input_tools.py. Available:
+# Registered in voice_input_tools.py + tools_*.py. Available:
+#   explore          — sub-agent that maps WHERE relevant code lives (delegate
+#                      broad "how/where is X done" investigation to this)
 #   semantic_search  — colgrep semantic code search over [tools].root
+#   file_list / tree — list files (gitignore-aware) / directory tree
+#   read_file        — read a file or line range
+#   tree_sitter      — symbol/structure outline of a source file (needs `code` extra)
+#   lsp              — hover/definition/references/diagnostics (needs `code` extra)
+#   exa_search / exa_contents — web search + page content (needs an Exa key below)
 #   browser_use      — ad-hoc browser screenshot + page text (browser-use CLI)
-#   playwright       — deterministic screenshot at an exact viewport size
+#   playwright       — deterministic screenshot at an exact viewport size (`browser` extra)
+#   shell            — run ONE allowlisted, read-only command (no shell operators)
 [tools]
-root = "."   # default search root for semantic_search (e.g. a repo path)
+root = "."                       # default root for search/file/code tools
+# exa_api_key = "exa-..."        # for exa_search / exa_contents (or $EXA_API_KEY)
+# shell_allow = ["git","ls","cat","rg","grep"]   # override the shell allowlist
 
 
 # ── named pipelines ──────────────────────────────────────────────────────────
@@ -74,11 +84,14 @@ Output ONLY the corrected text — no preamble, no quotes, no explanation.
 
 [[pipeline.agent]]
 # model = "minimax-m2.7"        # optional per-step override of [agent].model
-tools  = ["semantic_search", "browser_use", "playwright"]   # tools this step may call
+tools  = ["explore", "semantic_search", "file_list", "tree", "read_file",
+          "tree_sitter", "lsp", "exa_search", "exa_contents",
+          "browser_use", "playwright", "shell"]   # tools this step may call
 prompt = """
-You are a dictation assistant with tools. Use semantic_search to locate code,
-browser_use for ad-hoc page grabs, or playwright to screenshot a page at a
-specific size. Then output ONLY the final text to insert at the cursor.
+You are a dictation assistant with tools. Carry out the user's spoken request,
+then output ONLY the final text to insert at the cursor. Prefer `explore` to
+find where things live in the codebase; use semantic_search/read_file/lsp for
+specifics, exa_search for the web, browser_use/playwright for screenshots.
 """
 
 [[pipeline.chat]]

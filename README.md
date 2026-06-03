@@ -173,11 +173,21 @@ until the model answers (capped by `[agent].max_steps`, then a tool-free
 synthesis call forces a final answer). Tools are registered in
 `voice_input_tools.py` and run on your machine:
 
-| Tool | What it does |
-|------|--------------|
-| `semantic_search` | semantic code search over `[tools].root` via colgrep — returns matching units (file, line, snippet) |
-| `browser_use` | open a URL in a real browser, screenshot + read page text (ad-hoc browsing) |
-| `playwright` | screenshot a URL at an **exact viewport size** (deterministic, repeatable) |
+| Tool | What it does | Needs |
+|------|--------------|-------|
+| `explore` | sub-agent that maps **where** relevant code lives (delegate broad "how/where is X" investigation) | — |
+| `semantic_search` | semantic code search over `[tools].root` via colgrep | `colgrep` |
+| `file_list` / `tree` | list files (gitignore-aware) / directory tree | — |
+| `read_file` | read a file or line range | — |
+| `tree_sitter` | symbol/structure outline of a source file | `--extra code` |
+| `lsp` | hover / definition / references / diagnostics | `--extra code` |
+| `exa_search` / `exa_contents` | web search + page content via Exa | `[tools].exa_api_key` |
+| `browser_use` | ad-hoc browser screenshot + page text | `browser-use` CLI |
+| `playwright` | screenshot a URL at an **exact viewport size** | `--extra browser` |
+| `shell` | run ONE allowlisted, read-only command (no shell operators) | — |
+
+Tools live in `voice_input_tools.py` + `tools_*.py`; a missing backend disables
+only that tool. Install tool deps per group: `uv sync --extra code --extra browser`.
 
 So "find where we handle auth errors and summarize" searches your code and types
 a grounded answer; "screenshot example.com at 1024×768" captures the page. (Tool
