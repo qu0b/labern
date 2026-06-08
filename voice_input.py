@@ -2,9 +2,12 @@
 """
 Push-to-talk voice input: hold a key, speak, release — text appears at the cursor.
 
-Two engines, one per key (see BINDINGS below):
-    Right Ctrl  -> whisper-large-v3-turbo  (multilingual, EN+DE)
-    Right Shift -> parakeet-tdt-0.6b-v2    (English, faster, native punctuation)
+Three keys (see BINDINGS below), all whisper-large-v3-turbo (multilingual, EN+DE):
+    Right Ctrl  -> raw transcript, typed as-is
+    Right Shift -> "clean" pass: an LLM fixes transcription slips (run-together
+                   words, grammar, spelling) and normalizes technical terms from a
+                   glossary, then types the result — no panel, no tools
+    Right Alt   -> "agent" pass: tool-using agent carries out a spoken request
 
 Transcription runs on a remote OpenAI-compatible endpoint when one is configured
 (VOICE_INPUT_REMOTE_URL + an API key in ~/.config/voice-input/api_key or
@@ -30,10 +33,13 @@ Hotkey notes (Linux/X11):
 """
 
 import argparse
+import faulthandler
 import io
 import json
 import os
+import signal
 import platform
+import queue
 import re
 import subprocess
 import sys
@@ -52,19 +58,34 @@ except ImportError:  # pragma: no cover — py3.9/3.10 fallback
 
 SAMPLE_RATE = 16000
 SOUNDS = "/usr/share/sounds/freedesktop/stereo"
+# Hard ceiling on a single push-to-talk recording. pynput drops modifier
+# key-release events on X11 often enough that a stuck key is a real failure
+# mode: without this, the mic stream stays open and `frames` grows unbounded.
+# Well above any real dictation (longest observed ~53s) so it never clips speech.
+MAX_RECORD_SECONDS = 120
 
-# Per-key engine bindings: hold a key, its engine transcribes. language=None lets
-# the engine auto-detect (whisper is multilingual; parakeet is English-only so it
-# is pinned to en). Both engines share the remote endpoint + local fallback.
+# Per-key bindings: hold a key, transcribe, then run that key's pipeline (if any).
+# language=None lets whisper auto-detect (EN+DE). All three keys share the remote
+# endpoint + local fallback. ctrl_r types the raw transcript; shift_r runs the
+# inline "refine" clean-up pass; alt_r runs the tool-using "agent" pass (panel).
+# Parakeet (English-only, native punctuation) is retired from the default layout
+# because the clean-up/agent passes must handle German too — re-add a binding with
+# model="parakeet-tdt-0.6b-v2", language="en" if you want a fast English-only key.
 BINDINGS = [
-    {"key": "ctrl_r",  "model": "whisper-large-v3-turbo", "language": None, "label": "whisper"},
-    {"key": "shift_r", "model": "parakeet-tdt-0.6b-v2",   "language": "en", "label": "parakeet",
+    {"key": "ctrl_r",  "model": "whisper-large-v3-turbo", "language": None, "label": "raw"},
+    {"key": "shift_r", "model": "whisper-large-v3-turbo", "language": None, "label": "clean",
+     "pipeline": "refine"},
+    {"key": "alt_r",   "model": "whisper-large-v3-turbo", "language": None, "label": "agent",
      "pipeline": "agent"},
 ]
 
 # The AT-SPI helper that snapshots the focused widget; run on demand per dictation.
 CONTEXT_HELPER = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "voice_input_context.py")
+
+# The interactive agent panel (Tkinter), spawned when a tool-using pipeline fires.
+PANEL_HELPER = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "voice_input_panel.py")
 
 
 def _make_icon(color):
@@ -98,12 +119,16 @@ class VoiceInput:
                  remote_url=None, api_key=None, local_beam_size=1,
                  local_cpu_threads=None,
                  agent=None, pipelines=None, context_rules=None, tools_config=None,
-                 run_context_listener=True):
+                 run_context_listener=True, glossary=None):
         self.use_tray = use_tray
         self.initial_prompt = initial_prompt
+        # Technical-term dictionary for the LLM passes: substituted into any step
+        # prompt containing the literal {glossary} token (see _render_prompt).
+        self.glossary = glossary or ""
         self.recording = False
         self.frames = []
         self.stream = None
+        self._watchdog = None  # auto-stop timer; guards a missed key-release
         self._lock = threading.Lock()
         self.tray = None
         self._icons = {}
@@ -139,6 +164,10 @@ class VoiceInput:
         self.agent_timeout = agent.get("timeout", 60)
         self.agent_max_tokens = agent.get("max_tokens", 2048)  # required by /v1/messages
         self.agent_max_steps = agent.get("max_steps", 6)       # tool-loop iteration cap
+        # Reasoning depth for the endpoint ("thinking on + high"). Sent as the
+        # OpenAI-style `reasoning_effort` field, which the LiteLLM proxy maps to
+        # minimax's native reasoning. Empty/unset → no field sent (thinking off).
+        self.reasoning_effort = (agent.get("reasoning_effort") or "").strip()
         self.vision = bool(agent.get("vision", False))         # send tool images to the model
         self.image_output = bool(agent.get("image_output", True))  # tool images → clipboard
         self.tools_config = dict(tools_config or {})
@@ -158,6 +187,10 @@ class VoiceInput:
 
         if self.initial_prompt:
             print(f"vocab bias: {self.initial_prompt.count(',') + 1} terms")
+        if self.glossary:
+            print(f"glossary: {self.glossary.count(chr(10)) + 1} terms (LLM passes)")
+        if self.reasoning_effort:
+            print(f"reasoning_effort: {self.reasoning_effort}")
         where = "remote+local-fallback" if self.use_remote else f"local {self._model_size}"
         keys = ", ".join(f"[{b['key']}]={b['label']}" for b in self.bindings)
         print(f"ready ({where}) — hold {keys}")
@@ -221,21 +254,49 @@ class VoiceInput:
             blocksize=1024,
         )
         self.stream.start()
+        # Backstop a missed key-release: stop on our own after MAX_RECORD_SECONDS
+        # so a dropped modifier can never leave the mic open / frames unbounded.
+        self._watchdog = threading.Timer(MAX_RECORD_SECONDS, self._auto_stop)
+        self._watchdog.daemon = True
+        self._watchdog.start()
 
     def _audio_cb(self, indata, frames, time_info, status):
         if self.recording:
             self.frames.append(indata.copy())
 
+    def _auto_stop(self):
+        """Watchdog fire: a key-release was never seen. Stop as if released."""
+        if self.recording:
+            print(f"[auto-stop after {MAX_RECORD_SECONDS}s — key-release missed?]")
+            self._stop()
+
     def _stop(self):
+        # Runs in the pynput listener thread on key-release. Do the bare minimum
+        # here (flip the flag, detach the stream) and hand the rest — including the
+        # potentially-blocking PortAudio close() — to a worker, so a wedged audio
+        # device can never stall the keyboard listener and freeze input.
         with self._lock:
             if not self.recording:
                 return
             self.recording = False
             binding = self._active
-
+            stream, self.stream = self.stream, None
+        if self._watchdog is not None:
+            self._watchdog.cancel()
+            self._watchdog = None
         self._cue("message.oga")  # mic off, transcribing
-        self.stream.stop()
-        self.stream.close()
+        # The audio callback no longer appends once `recording` is False, so the
+        # frames are frozen and safe to read from the worker.
+        threading.Thread(target=self._finish, args=(stream, binding),
+                         daemon=True).start()
+
+    def _finish(self, stream, binding):
+        """Off the listener thread: close the stream, then transcribe."""
+        try:
+            stream.stop()
+            stream.close()
+        except Exception as e:  # a wedged device must not take down the app
+            print(f"[audio close failed: {e}]")
 
         if not self.frames:
             print("(empty)")
@@ -253,7 +314,7 @@ class VoiceInput:
         sys.stdout.write(f"{duration:.1f}s ")
         sys.stdout.flush()
         self._set_state("busy")
-        threading.Thread(target=self._transcribe, args=(audio, binding), daemon=True).start()
+        self._transcribe(audio, binding)
 
     def _ensure_local_model(self):
         if self.model is None:
@@ -283,17 +344,26 @@ class VoiceInput:
                 print("(no speech)")
                 return
 
-            # Optional context-aware transform pipeline. Fail-open: any error
-            # returns the best text so far — dictation is never lost.
+            # Optional context-aware transform. A tool-using ('agent') pipeline is
+            # interactive: it runs behind the panel, which streams progress and owns
+            # the result (edit/copy/refine/insert). Plain pipelines (grammar/chat)
+            # run inline and are typed like raw text. Fail-open throughout.
             images = []
             if binding.get("pipeline") or self.context_rules:
-                self._set_state("refining")
-                text, pipe, images = self._refine(text, binding)
-                if pipe:
-                    source = f"{source} → {pipe}"
-                if not text.strip() and not images:
-                    print("(empty after pipeline)")
+                name, steps, note = self._plan_pipeline(binding)
+                if steps and any(s.get("tools") for s in steps):
+                    self._set_state("refining")
+                    print(f"-> [{source} → {name}] (agent panel)")
+                    self._agent_panel_session(text, steps, note, f"{source} → {name}")
                     return
+                if steps:  # plain inline pipeline (grammar / chat)
+                    self._set_state("refining")
+                    text, imgs = self._agent_steps_run(text, steps, note)
+                    images.extend(imgs)
+                    source = f"{source} → {name}"
+                    if not text.strip() and not images:
+                        print("(empty after pipeline)")
+                        return
 
             print(f"-> [{source}] {text}")
             if text.strip():
@@ -443,6 +513,14 @@ class VoiceInput:
                      "tree_sitter, lsp) unless the request clearly points elsewhere.")
         return note
 
+    def _render_prompt(self, prompt):
+        """Substitute the {glossary} token in a step prompt with the technical-term
+        dictionary so the LLM normalizes mis-transcribed jargon to canonical forms.
+        Prompts without the token are returned unchanged (glossary is opt-in)."""
+        if "{glossary}" in prompt:
+            return prompt.replace("{glossary}", self.glossary or "(none)")
+        return prompt
+
     def _agent_step(self, text, step, ctx_note=""):
         """POST one transform step to the agent endpoint. Prefers the Anthropic
         /v1/messages API (system top-level, max_tokens required); falls back to
@@ -450,7 +528,7 @@ class VoiceInput:
         with `tools` runs the agentic tool-use loop instead. ctx_note (app/window/
         repo) is appended to the system prompt of tool steps so the agent knows
         where it is. Returns (reply_text, image_paths)."""
-        model, system = step.get("model") or self.agent_model, step["prompt"]
+        model, system = step.get("model") or self.agent_model, self._render_prompt(step["prompt"])
         if ctx_note and step.get("tools"):  # situational awareness for agent steps
             system = f"{system}\n\n{ctx_note}"
         is_messages = self.agent_url.rstrip("/").endswith("/messages")
@@ -473,18 +551,22 @@ class VoiceInput:
         resp.raise_for_status()
         return resp.json()["choices"][0]["message"]["content"].strip(), []
 
-    def _agent_tool_loop(self, text, system, model, tool_names):
+    def _agent_tool_loop(self, text, system, model, tool_names, emit=None, cancel=None):
         """Gather-then-synthesize. Phase 1: let the model call tools (tool_choice
         auto), collecting their text results AND any images they produce; if it
         answers directly, use that. Phase 2 (on hitting max_steps without an
         answer): a fresh, TOOL-FREE call that hands the model the findings and
         asks for prose — search-eager models (minimax) keep searching when tools
-        are present but answer cleanly when they aren't. Returns (text, images)."""
+        are present but answer cleanly when they aren't. `emit` (when set) receives
+        progress events for the panel; `cancel` (an Event) stops it between steps.
+        Returns (text, images)."""
         from voice_input_tools import TOOLS
         tools = [TOOLS[n]["schema"] for n in tool_names if n in TOOLS]
         messages = [{"role": "user", "content": text}]
         findings, images = [], []
         for _ in range(self.agent_max_steps):
+            if cancel is not None and cancel.is_set():
+                break
             data = self._messages_call(model, system, messages, tools=tools)
             blocks = data.get("content") or []
             if data.get("stop_reason") != "tool_use":
@@ -497,12 +579,17 @@ class VoiceInput:
             results = []
             for b in blocks:
                 if b.get("type") == "tool_use":
+                    if emit:
+                        emit({"type": "tool", "name": b.get("name"),
+                              "input": b.get("input") or {}})
                     out_text, out_imgs = self._tool_result(b.get("name"), b.get("input") or {})
                     images.extend(out_imgs)
                     findings.append(f"{b.get('name')}({b.get('input')}):\n{out_text}")
                     results.append({"type": "tool_result", "tool_use_id": b.get("id"),
                                     "content": self._render_tool_content(out_text, out_imgs)})
             messages.append({"role": "user", "content": results})
+        if emit:
+            emit({"type": "status", "text": "composing answer…"})
         return self._agent_synthesize(model, system, text, findings), images
 
     def _agent_synthesize(self, model, system, question, findings):
@@ -525,6 +612,8 @@ class VoiceInput:
                    "system": system, "messages": messages}
         if tools:
             payload["tools"] = tools
+        if self.reasoning_effort:  # "thinking on + high" — proxy maps to minimax reasoning
+            payload["reasoning_effort"] = self.reasoning_effort
         resp = _http().post(
             self.agent_url,
             headers={"Authorization": f"Bearer {self.api_key}",
@@ -582,35 +671,191 @@ class VoiceInput:
         except OSError:
             return None
 
-    def _refine(self, text, binding):
-        """Chain the selected pipeline's steps. Returns (text, name, images) where
-        images are any artifacts tools produced. Fail-open: keep best text on error."""
+    def _plan_pipeline(self, binding):
+        """Pick the pipeline for the current focus and return (name, steps, note),
+        scoping the code/file tools to the focused repo. (name, None, None) when
+        there is nothing to run (no/raw pipeline, undefined steps, or no agent URL)."""
         ctx = self._context()
         name = self._select_pipeline(binding, ctx)
         if not name or name == "raw":
-            return text, None, []
+            return None, None, None
         steps = self.pipelines.get(name)
         if not steps or not self.agent_url:
-            return text, None, []  # warning was already printed at startup
-        # Scope code/file tools to the repo the user is focused on, and tell the
-        # agent where it is (app + window + repo) — context the user expects.
+            return name, None, None  # warning was already printed at startup
         root = self._resolve_root(ctx)
         self.tools_config = {**self._base_tools_config, "root": root}
-        note = self._context_note(ctx, root)
+        return name, steps, self._context_note(ctx, root)
+
+    def _agent_steps_run(self, text, steps, note, emit=None, cancel=None):
+        """Chain a pipeline's steps, threading the running text through each. Tool
+        steps run the agentic loop (with optional panel `emit`/`cancel`); plain
+        steps are a single LLM call. Fail-open: keep the best text on error.
+        Returns (text, images)."""
         out, images = text, []
         for i, step in enumerate(steps):
             try:
-                new, imgs = self._agent_step(out, step, note)
-                images.extend(imgs)
-                if new:
-                    out = new
+                if step.get("tools"):
+                    system = self._render_prompt(step["prompt"]) + (f"\n\n{note}" if note else "")
+                    model = step.get("model") or self.agent_model
+                    new, imgs = self._agent_tool_loop(
+                        out, system, model, step["tools"], emit=emit, cancel=cancel)
                 else:
-                    print(f"[pipeline '{name}' step {i} returned empty — keeping prior]")
+                    new, imgs = self._agent_step(out, step, note)
             except Exception as e:
-                print(f"[pipeline '{name}' step {i} failed: {e} — keeping prior]")
+                if emit:
+                    emit({"type": "error", "text": str(e)})
+                print(f"[pipeline step {i} failed: {e} — keeping prior]")
                 self._cue("dialog-warning.oga")
                 break
-        return out, name, images
+            images.extend(imgs)
+            if new:
+                out = new
+            if cancel is not None and cancel.is_set():
+                break
+        return out, images
+
+    def _agent_panel_session(self, text, steps, note, source):
+        """Run the agent behind the interactive panel: stream each tool call, show
+        the answer in an editable box, and let the user Insert / Copy / Refine /
+        Cancel before anything is typed. Owns typing + clipboard for this dictation.
+        Fail-open: if the panel can't be spawned, fall back to the clipboard."""
+        target = self._active_window_id()
+        try:
+            # System python (GTK lives there, like the AT-SPI helper); the uv
+            # venv's bundled Tk is unusable under a mainloop.
+            proc = subprocess.Popen(
+                ["/usr/bin/python3", PANEL_HELPER, "--request", text[:300]],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, bufsize=1)
+        except OSError as e:
+            print(f"[panel spawn failed: {e} — running headless, copying result]")
+            answer, _imgs = self._agent_steps_run(text, steps, note)
+            if answer:
+                self._copy_text(answer)
+            self._notify(answer or "(no result)", f"{source} → clipboard")
+            return
+
+        actions = queue.Queue()
+        cancel = threading.Event()
+
+        def _reader():
+            for line in proc.stdout:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    a = json.loads(line)
+                except ValueError:
+                    continue
+                if a.get("action") == "cancel":
+                    cancel.set()
+                actions.put(a)
+            actions.put({"action": "_eof"})
+
+        threading.Thread(target=_reader, daemon=True).start()
+
+        def emit(ev):
+            try:
+                proc.stdin.write(json.dumps(ev) + "\n")
+                proc.stdin.flush()
+            except (OSError, ValueError):
+                pass
+
+        emit({"type": "status", "text": "transcribed — thinking…"})
+        answer, images = self._agent_steps_run(text, steps, note, emit=emit, cancel=cancel)
+        emit({"type": "result", "text": answer or "(no answer)"})
+        last = answer or ""
+
+        dismissed = False
+        while True:
+            a = actions.get()
+            act = a.get("action")
+            if act in ("cancel", "_eof"):
+                dismissed = (act == "cancel")
+                break
+            if act == "copy":
+                self._copy_text(a.get("text") or last)
+                self._notify("copied to clipboard", source)
+                continue
+            if act == "refine":
+                cancel.clear()
+                emit({"type": "status", "text": "refining…"})
+                revised = (f"Previous answer:\n{last}\n\nRevise it per this "
+                           f"instruction: {a.get('text') or ''}")
+                answer, imgs = self._agent_steps_run(
+                    revised, steps, note, emit=emit, cancel=cancel)
+                images.extend(imgs)
+                last = answer or last
+                emit({"type": "result", "text": last})
+                continue
+            if act == "insert":
+                final = a.get("text") or last
+                self._wait_proc(proc)          # let the panel close so focus returns
+                self._focus_window(target)
+                if final.strip():
+                    self._type(final)
+                if images and self.image_output:
+                    self._emit_image(images[-1])
+                self._notify(final or "(image)", f"{source} → inserted")
+                return
+        self._terminate(proc)
+        if not dismissed and last.strip():
+            # The panel went away without an explicit choice (e.g. no display or
+            # GTK missing) — don't lose the answer; leave it on the clipboard.
+            self._copy_text(last)
+            self._notify(last, f"{source} → clipboard")
+
+    @staticmethod
+    def _active_window_id():
+        """X11 id of the focused window (to refocus before Insert), or None."""
+        if os.environ.get("WAYLAND_DISPLAY"):
+            return None
+        try:
+            r = subprocess.run(["xdotool", "getactivewindow"],
+                               capture_output=True, text=True, timeout=2)
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        return r.stdout.strip() or None
+
+    @staticmethod
+    def _focus_window(wid):
+        """Re-activate the window captured before the panel stole focus (X11)."""
+        if not wid:
+            return
+        try:
+            subprocess.run(["xdotool", "windowactivate", "--sync", wid],
+                           check=False, timeout=3)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+
+    def _copy_text(self, text):
+        """Put plain text on the clipboard (wl-copy on Wayland, else xclip)."""
+        try:
+            if os.environ.get("WAYLAND_DISPLAY"):
+                subprocess.run(["wl-copy"], input=text.encode(), check=False)
+            else:
+                subprocess.run(["xclip", "-selection", "clipboard"],
+                               input=text.encode(), check=False)
+        except OSError as e:
+            print(f"[copy failed: {e}]")
+
+    @staticmethod
+    def _wait_proc(proc):
+        try:
+            proc.wait(timeout=5)
+        except (subprocess.TimeoutExpired, OSError):
+            pass
+
+    @staticmethod
+    def _terminate(proc):
+        try:
+            if proc.poll() is None:
+                proc.terminate()
+                proc.wait(timeout=2)
+        except (OSError, subprocess.TimeoutExpired):
+            try:
+                proc.kill()
+            except OSError:
+                pass
 
     def _emit_image(self, path):
         """Put a tool-produced image on the clipboard so it can be pasted straight
@@ -701,6 +946,31 @@ def _load_vocab(path):
     return ", ".join(terms) if terms else None
 
 
+def _load_glossary(path):
+    """Read a technical-term dictionary into a prompt block for the LLM passes.
+
+    One entry per line; '#' starts a comment. A bare line is a canonical term; a
+    line of the form `heard form, other form => Canonical` also lists common
+    mis-transcriptions to fold back to the canonical spelling. Returns a formatted
+    bullet list (or None when the file is missing/empty)."""
+    try:
+        with open(path) as f:
+            lines = [ln.strip() for ln in f if ln.strip() and not ln.startswith("#")]
+    except OSError:
+        return None
+    out = []
+    for ln in lines:
+        if "=>" in ln:
+            heard, canon = ln.split("=>", 1)
+            variants = ", ".join(v.strip() for v in heard.split(",") if v.strip())
+            canon = canon.strip()
+            out.append(f"- {canon}" + (f" (often mis-transcribed as: {variants})"
+                                       if variants else ""))
+        else:
+            out.append(f"- {ln}")
+    return "\n".join(out) if out else None
+
+
 def _load_config(path):
     """Parse the optional TOML config. Missing → {}; malformed → SystemExit (fail-fast)."""
     try:
@@ -712,7 +982,30 @@ def _load_config(path):
         raise SystemExit(f"bad config {path}: {e}")
 
 
+def _install_crash_logging():
+    """Make a future freeze diagnosable. Without this the process vanished with no
+    trace; now a native crash dumps a traceback, an uncaught Python exception is
+    logged, and a kill signal says so — all to stderr, captured by the journal."""
+    faulthandler.enable()  # dump C-level traceback on SIGSEGV/SIGABRT etc.
+
+    def _on_signal(sig, _frame):
+        print(f"[exiting on signal {signal.Signals(sig).name}]", flush=True)
+        os._exit(0)
+
+    for s in (signal.SIGTERM, signal.SIGINT):
+        signal.signal(s, _on_signal)
+
+    def _thread_excepthook(args):
+        import traceback
+        print(f"[uncaught in thread {args.thread.name if args.thread else '?'}]",
+              flush=True)
+        traceback.print_exception(args.exc_type, args.exc_value, args.exc_traceback)
+
+    threading.excepthook = _thread_excepthook
+
+
 def main():
+    _install_crash_logging()
     p = argparse.ArgumentParser(description="Push-to-talk voice input (two engines on two keys)")
     p.add_argument("-m", "--model", default="small",
                    help="LOCAL fallback whisper model size (tiny/base/small/medium/large-v3)")
@@ -784,6 +1077,13 @@ def main():
     agent = dict(config.get("agent") or {})
     if args.agent_url:
         agent["url"] = args.agent_url
+
+    # Technical-term dictionary for the LLM passes (separate from the whisper vocab
+    # above): [agent].glossary, else terms.txt next to this script. Injected wherever
+    # a pipeline prompt contains the {glossary} token.
+    glossary_path = agent.get("glossary") or os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "terms.txt")
+    glossary = _load_glossary(os.path.expanduser(glossary_path))
     pipelines = config.get("pipeline") or {}        # {name: [step, ...]}
     context_rules = config.get("context") or []    # [{field: regex, ..., pipeline: name}, ...]
     tools_config = config.get("tools") or {}        # {root: ..., ...} for local tools
@@ -796,7 +1096,8 @@ def main():
                prompt, remote_url, api_key, local_beam_size, local_cpu_threads,
                agent=agent, pipelines=pipelines, context_rules=context_rules,
                tools_config=tools_config,
-               run_context_listener=not args.no_context_listener).run()
+               run_context_listener=not args.no_context_listener,
+               glossary=glossary).run()
 
 
 if __name__ == "__main__":

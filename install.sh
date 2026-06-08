@@ -17,16 +17,19 @@ if ! command -v uv >/dev/null; then
 fi
 
 # 2. System deps
-#    AT-SPI bits (python3-gi, gir1.2-atspi-2.0) are used by voice_input_context.py
-#    — labern's focus listener helper that powers context-aware pipeline routing.
+#    python3-gi + gir1.2-atspi-2.0 power voice_input_context.py (focus snapshots);
+#    gir1.2-gtk-3.0 powers voice_input_panel.py (the interactive agent panel). Both
+#    helpers run under the SYSTEM python — the uv venv's bundled Tk is unusable.
 echo "==> installing system packages (requires sudo)"
 sudo apt install -y \
     libportaudio2 \
     xdotool \
+    xclip \
     gir1.2-ayatanaappindicator3-0.1 \
     gnome-shell-extension-appindicator \
     python3-gi \
-    gir1.2-atspi-2.0
+    gir1.2-atspi-2.0 \
+    gir1.2-gtk-3.0
 
 # 3. Python environment — uv reads pyproject.toml/uv.lock and builds .venv
 echo "==> syncing Python deps with uv"

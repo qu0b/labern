@@ -1,0 +1,41 @@
+# Technical-term dictionary for the LLM passes (Right Shift "clean" + Right Alt "agent").
+#
+# Copy this to `terms.txt` (gitignored) and fill it with YOUR jargon:
+#     cp terms.example.txt terms.txt
+#
+# This is DIFFERENT from vocab.txt:
+#   - vocab.txt biases the WHISPER acoustic model (must be tiny, ~223 tokens, EN only).
+#   - terms.txt is handed to the LLM, which rewrites the transcript. No size budget,
+#     so be generous: list anything speech-to-text tends to garble, split, or anglicize.
+#
+# The clean pass replaces mis-transcribed forms with the canonical spelling below and
+# rejoins run-together words. Reference it from a pipeline prompt with the {glossary}
+# token (see config.example.toml -> [[pipeline.refine]]). One entry per line, # = comment.
+#
+# Two line formats:
+#   Canonical                      -> just ensure this spelling/casing is used
+#   heard form, other => Canonical -> also fold these mishearings back to Canonical
+
+# --- domains / endpoints (speech-to-text loves to mangle these) ---
+ai.starflinger.eu
+star flinger, starflinger, star slinger => ai.starflinger.eu
+
+# --- dev tooling (examples — replace with your stack) ---
+PostgreSQL
+post grass, postgres, postgre sql => PostgreSQL
+kubectl
+cube cuttle, cube control => kubectl
+Next.js
+next js, nextjs => Next.js
+LiteLLM
+light llm, lite l l m => LiteLLM
+minimax-m2.7
+mini max, minimax m two => minimax-m2.7
+
+# --- product / project names ---
+labern
+la burn, la bern => labern
+
+# --- people / usernames ---
+# alice
+# bob

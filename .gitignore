@@ -2,5 +2,6 @@
 __pycache__/
 *.pyc
 
-# Personal glossary — copy vocab.example.txt to vocab.txt and customize.
+# Personal glossaries — copy the .example.txt files and customize.
 vocab.txt
+terms.txt

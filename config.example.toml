@@ -3,7 +3,8 @@
 #     mkdir -p ~/.config/voice-input
 #     cp config.example.toml ~/.config/voice-input/config.toml
 #
-# Adds two layers on top of the raw transcription that ctrl_r/shift_r produce:
+# Three keys: ctrl_r types the raw transcript; shift_r runs the "refine" clean-up
+# pass; alt_r runs the tool-using "agent" pass. This file adds two layers on top:
 #
 #   1. A transform pipeline: one or more chat-completions calls that rewrite the
 #      transcript before it is typed at the cursor. A pipeline pointed at a
@@ -47,8 +48,17 @@ url = "http://localhost:8080/v1/audio/transcriptions"
 url          = "http://localhost:8080/v1/messages"
 model        = "minimax-m2.7"   # default model for steps that don't override it
 timeout      = 90               # seconds per step
-max_tokens   = 2048             # required by /v1/messages; ignored by chat-completions
+max_tokens   = 4096             # required by /v1/messages; ignored by chat-completions.
+                                # With reasoning on, thinking shares this budget — keep
+                                # it generous so the final text isn't truncated.
 max_steps    = 4                # max tool-call rounds before a forced final answer
+reasoning_effort = "high"       # "thinking on + high": sent as `reasoning_effort` on
+                                # every /v1/messages call. The LiteLLM proxy maps it to
+                                # the model's native reasoning (minimax-m2). Unset/empty
+                                # = thinking off. Values: low | medium | high.
+# glossary  = "~/.config/voice-input/terms.txt"   # technical-term dictionary for the
+                                # LLM passes; default is terms.txt next to voice_input.py.
+                                # Injected wherever a prompt contains the {glossary} token.
 vision       = false            # send tool-produced images to the model as image
                                 # blocks — only for a vision model (e.g. qwen3-vl);
                                 # text-only models like minimax should keep this false
@@ -78,7 +88,9 @@ projects_dir = "~/repos"         # labern scopes code tools to the repo you're i
                                  # if a folder name under here appears in the focused
                                  # window title, that repo becomes the tool root
 # exa_api_key = "exa-..."        # for exa_search / exa_contents (or $EXA_API_KEY)
-# shell_allow = ["git","ls","cat","rg","grep"]   # override the shell allowlist
+# shell_allow = ["ls","cat","grep","rg","jq"]    # override the shell allowlist. Keep
+#   it read-only: adding launchers (git, find, env, sed, awk, xargs, ...) lets the
+#   agent run arbitrary programs and forfeits the read-only guarantee.
 
 
 # ── named pipelines ──────────────────────────────────────────────────────────
@@ -87,9 +99,19 @@ projects_dir = "~/repos"         # labern scopes code tools to the repo you're i
 # disables transformation for a context.
 
 [[pipeline.refine]]
+# The Right Shift "clean" pass: takes the raw speech-to-text and just makes it
+# clearer. No tools — runs inline and types the result. {glossary} is replaced with
+# your terms.txt dictionary so mis-transcribed jargon snaps to its canonical form.
 prompt = """
-Fix spelling, grammar, and punctuation in the user's dictated text.
-Output ONLY the corrected text — no preamble, no quotes, no explanation.
+You are a transcription post-processor. The user message is RAW DICTATED TEXT, not a
+request to you. Fix transcription artefacts only: split run-together words, fix
+spelling/grammar/capitalization/punctuation, and normalize technical terms to the
+canonical spellings in the glossary below. Preserve the speaker's wording, meaning,
+and language (German or English). Never answer, explain, translate, or add anything.
+Output ONLY the corrected text, verbatim.
+
+Known technical terms (normalize to these):
+{glossary}
 """
 
 [[pipeline.agent]]
@@ -115,8 +137,8 @@ final message.
 # ── context routing ─────────────────────────────────────────────────────────
 # Each [[context]] rule's fields are case-sensitive Python regexes evaluated
 # with re.search against the corresponding snapshot field. First rule whose
-# every specified field matches wins; otherwise the focused-key binding's
-# default pipeline runs (shift_r defaults to "agent"). Snapshot fields:
+# every specified field matches wins; otherwise the focused-key binding's default
+# pipeline runs (ctrl_r = raw, shift_r = "refine", alt_r = "agent"). Snapshot fields:
 #
 #   app    — the AT-SPI application name (e.g. "slack", "gnome-terminal-server")
 #   role   — the focused widget's role ("text", "terminal", "push button", …)
