@@ -385,7 +385,8 @@ class VoiceInput:
             # the result (edit/copy/refine/insert). Plain pipelines (grammar/chat)
             # run inline and are typed like raw text. Fail-open throughout.
             images = []
-            if binding.get("pipeline") or self.context_rules:
+            # Raw key: no pipeline, no context snapshot — straight to typing.
+            if binding.get("pipeline"):
                 name, steps, note = self._plan_pipeline(binding)
                 if steps and any(s.get("tools") for s in steps):
                     self._set_state("refining")
@@ -505,7 +506,11 @@ class VoiceInput:
         return compiled
 
     def _select_pipeline(self, binding, ctx):
-        """First context rule whose every regex matches ctx wins; else binding default."""
+        """First context rule whose every regex matches ctx wins; else binding default.
+        Keys without a pipeline (the raw key) are exempt: they always type the
+        verbatim transcript — context rules must never route them into an LLM."""
+        if not binding.get("pipeline"):
+            return None
         for matchers, rule in self._compiled_rules:
             if all(rx.search(ctx.get(field, "") or "") for field, rx in matchers):
                 return rule.get("pipeline")

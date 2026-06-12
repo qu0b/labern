@@ -152,7 +152,9 @@ final message.
 # Each [[context]] rule's fields are case-sensitive Python regexes evaluated
 # with re.search against the corresponding snapshot field. First rule whose
 # every specified field matches wins; otherwise the focused-key binding's default
-# pipeline runs (ctrl_r = raw, shift_r = "refine", alt_r = "agent"). Snapshot fields:
+# pipeline runs (ctrl_r = raw, shift_r = "refine", alt_r = "agent"). Rules only
+# re-route keys that already run a pipeline: the raw key (ctrl_r) always types
+# the verbatim transcript and never enters an LLM pass. Snapshot fields:
 #
 #   app    — the AT-SPI application name (e.g. "slack", "gnome-terminal-server")
 #   role   — the focused widget's role ("text", "terminal", "push button", …)
