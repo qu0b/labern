@@ -246,19 +246,41 @@ class VoiceInput:
         self._set_state("recording")
         self._cue("bell.oga")  # mic is hot
 
-        self.stream = sd.InputStream(
-            samplerate=SAMPLE_RATE,
-            channels=1,
-            dtype="int16",
-            callback=self._audio_cb,
-            blocksize=1024,
-        )
-        self.stream.start()
+        # Open the PortAudio stream off the listener thread: open() blocks on a
+        # wedged audio device exactly like close(), and must never stall key
+        # handling (the same mechanism that froze the desktop on key-release).
+        threading.Thread(target=self._open_stream, args=(binding,),
+                         daemon=True).start()
         # Backstop a missed key-release: stop on our own after MAX_RECORD_SECONDS
         # so a dropped modifier can never leave the mic open / frames unbounded.
         self._watchdog = threading.Timer(MAX_RECORD_SECONDS, self._auto_stop)
         self._watchdog.daemon = True
         self._watchdog.start()
+
+    def _open_stream(self, binding):
+        """Worker: bring up the input stream, or discard it if the key was already
+        released (or re-bound) before the device finished opening."""
+        try:
+            stream = sd.InputStream(
+                samplerate=SAMPLE_RATE,
+                channels=1,
+                dtype="int16",
+                callback=self._audio_cb,
+                blocksize=1024,
+            )
+            stream.start()
+        except Exception as e:
+            print(f"[audio open failed: {e}]")
+            return
+        with self._lock:
+            if self.recording and self._active is binding:
+                self.stream = stream
+                return
+        try:
+            stream.stop()
+            stream.close()
+        except Exception as e:
+            print(f"[audio close failed: {e}]")
 
     def _audio_cb(self, indata, frames, time_info, status):
         if self.recording:
@@ -292,11 +314,12 @@ class VoiceInput:
 
     def _finish(self, stream, binding):
         """Off the listener thread: close the stream, then transcribe."""
-        try:
-            stream.stop()
-            stream.close()
-        except Exception as e:  # a wedged device must not take down the app
-            print(f"[audio close failed: {e}]")
+        if stream is not None:  # None if the device never finished opening
+            try:
+                stream.stop()
+                stream.close()
+            except Exception as e:  # a wedged device must not take down the app
+                print(f"[audio close failed: {e}]")
 
         if not self.frames:
             print("(empty)")
@@ -1006,6 +1029,9 @@ def _install_crash_logging():
     trace; now a native crash dumps a traceback, an uncaught Python exception is
     logged, and a kill signal says so — all to stderr, captured by the journal."""
     faulthandler.enable()  # dump C-level traceback on SIGSEGV/SIGABRT etc.
+    # Live-diagnose a wedge: `kill -USR1 <pid>` dumps every thread's stack to
+    # stderr (the journal) without killing the process.
+    faulthandler.register(signal.SIGUSR1, all_threads=True)
 
     def _on_signal(sig, _frame):
         print(f"[exiting on signal {signal.Signals(sig).name}]", flush=True)
