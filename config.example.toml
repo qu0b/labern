@@ -110,6 +110,17 @@ canonical spellings in the glossary below. Preserve the speaker's wording, meani
 and language (German or English). Never answer, explain, translate, or add anything.
 Output ONLY the corrected text, verbatim.
 
+File paths: when the dictation clearly describes a filesystem path — a run of folder
+names, usually cued by "home", "tilde", "root", "slash", "path", or "directory", or
+matching a known project below — render it as a real path. Map a leading "home" or
+"tilde" to ~, join the components with /, and remove spaces inside a single name.
+Match spoken component names to the known projects when one clearly corresponds.
+Example: "home repos eth pandaops" -> ~/repos/ethpandaops. Only do this for genuine
+paths — never turn ordinary prose into a path.
+
+Known projects (folders under ~/repos):
+{projects}
+
 Known technical terms (normalize to these):
 {glossary}
 """

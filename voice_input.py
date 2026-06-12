@@ -514,12 +514,31 @@ class VoiceInput:
         return note
 
     def _render_prompt(self, prompt):
-        """Substitute the {glossary} token in a step prompt with the technical-term
-        dictionary so the LLM normalizes mis-transcribed jargon to canonical forms.
-        Prompts without the token are returned unchanged (glossary is opt-in)."""
+        """Substitute placeholder tokens in a step prompt:
+          {glossary} → the technical-term dictionary (canonical jargon spellings).
+          {projects} → the real directory names under projects_dir, so the model can
+                       reconstruct spoken file paths ("home repos ethpandaops" →
+                       ~/repos/ethpandaops) with correct repo names and casing.
+        Prompts without a token are returned unchanged (both are opt-in)."""
         if "{glossary}" in prompt:
-            return prompt.replace("{glossary}", self.glossary or "(none)")
+            prompt = prompt.replace("{glossary}", self.glossary or "(none)")
+        if "{projects}" in prompt:
+            prompt = prompt.replace("{projects}", self._project_names() or "(none)")
         return prompt
+
+    def _project_names(self):
+        """Comma-joined directory names under projects_dir (cached for the process).
+        Feeds the {projects} token so the clean pass knows valid repo names."""
+        if getattr(self, "_projects_cache", None) is None:
+            names = []
+            try:
+                names = sorted(d for d in os.listdir(self.projects_dir)
+                               if os.path.isdir(os.path.join(self.projects_dir, d))
+                               and not d.startswith("."))
+            except OSError:
+                pass
+            self._projects_cache = ", ".join(names)
+        return self._projects_cache
 
     def _agent_step(self, text, step, ctx_note=""):
         """POST one transform step to the agent endpoint. Prefers the Anthropic
