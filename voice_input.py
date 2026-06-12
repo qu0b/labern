@@ -360,7 +360,8 @@ class VoiceInput:
             text, source = None, None
             if self.use_remote:
                 try:
-                    text = self._transcribe_remote(audio, model, language)
+                    text = self._transcribe_remote(audio, model, language,
+                                                   binding.get("url"))
                     source = f"{label} · GPU"
                 except Exception as e:  # endpoint down / network
                     if not self.local_fallback:
@@ -424,8 +425,9 @@ class VoiceInput:
         segments, _ = self.model.transcribe(audio_f32, **opts)
         return " ".join(seg.text for seg in segments)
 
-    def _transcribe_remote(self, audio, model, language):
-        """POST the clip to an OpenAI-compatible /v1/audio/transcriptions endpoint."""
+    def _transcribe_remote(self, audio, model, language, url=None):
+        """POST the clip to an OpenAI-compatible /v1/audio/transcriptions endpoint.
+        `url` lets a binding target its own STT server (see [stt.models])."""
         buf = io.BytesIO()
         with wave.open(buf, "wb") as w:
             w.setnchannels(1)
@@ -439,7 +441,7 @@ class VoiceInput:
         if self.initial_prompt:
             data["prompt"] = self.initial_prompt  # OpenAI's term-bias field
         resp = _http().post(
-            self.remote_url,
+            url or self.remote_url,
             headers={"Authorization": f"Bearer {self.api_key}"},
             files={"file": ("audio.wav", buf, "audio/wav")},
             data=data,
@@ -1136,6 +1138,12 @@ def main():
     local_fallback = bool(stt.get("local_fallback", False))
 
     bindings = [dict(b) for b in BINDINGS]
+    # Per-key STT overrides: [stt.models] maps a binding label to its own
+    # model/url/language (e.g. raw -> parakeet on a separate server).
+    for label, ov in (stt.get("models") or {}).items():
+        for b in bindings:
+            if b["label"] == label:
+                b.update({k: ov[k] for k in ("model", "url", "language") if k in ov})
     if args.language:  # global override across all keys
         for b in bindings:
             b["language"] = args.language

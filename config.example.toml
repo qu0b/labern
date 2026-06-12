@@ -34,6 +34,13 @@
 url = "http://localhost:8080/v1/audio/transcriptions"
 # local_fallback = true  # opt-in: decode on local CPU when the remote fails.
 #                        # Off by default — fail fast instead of pinning the CPU.
+#
+# Per-key STT overrides: route a binding (by label: raw/clean/agent) to its own
+# model/url/language. Lets the raw key use a fast English-only engine on a
+# separate server while the LLM-pass keys keep multilingual whisper.
+# [stt.models]
+# raw   = { model = "parakeet-tdt-0.6b-v2", url = "http://host:8031/v1/audio/transcriptions", language = "en" }
+# clean = { model = "deepdml/faster-whisper-large-v3-turbo-ct2" }
 # beam_size = 1   # local-fallback decode width. 1 (greedy) is ~3x faster on CPU
 #                 # with marginally higher WER on short clips; raise to 5 for the
 #                 # old quality-first behavior. Only affects the local model.
