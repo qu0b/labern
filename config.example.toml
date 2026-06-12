@@ -27,10 +27,13 @@
 # ── speech-to-text endpoint ──────────────────────────────────────────────────
 [stt]
 # Remote transcription endpoint (OpenAI-compatible /v1/audio/transcriptions).
-# Per-key engine model names live in BINDINGS in voice_input.py. Falls back to a
-# local whisper model if unreachable. Omit this section to run local-only.
+# Per-key engine model names live in BINDINGS in voice_input.py. If the endpoint
+# fails, the clip is dropped (toast + warning sound) — set local_fallback = true
+# to instead decode it on local CPU. Omit this section to run local-only.
 # --remote-url / $VOICE_INPUT_REMOTE_URL override it.
 url = "http://localhost:8080/v1/audio/transcriptions"
+# local_fallback = true  # opt-in: decode on local CPU when the remote fails.
+#                        # Off by default — fail fast instead of pinning the CPU.
 # beam_size = 1   # local-fallback decode width. 1 (greedy) is ~3x faster on CPU
 #                 # with marginally higher WER on short clips; raise to 5 for the
 #                 # old quality-first behavior. Only affects the local model.

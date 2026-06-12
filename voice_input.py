@@ -11,8 +11,10 @@ Three keys (see BINDINGS below), all whisper-large-v3-turbo (multilingual, EN+DE
 
 Transcription runs on a remote OpenAI-compatible endpoint when one is configured
 (VOICE_INPUT_REMOTE_URL + an API key in ~/.config/voice-input/api_key or
-$VOICE_INPUT_API_KEY); otherwise — or if the endpoint is unreachable — it uses a
-local faster-whisper model. Works fully offline out of the box.
+$VOICE_INPUT_API_KEY). If the endpoint fails, the clip is DROPPED (with a toast)
+unless [stt].local_fallback = true explicitly opts in to local-CPU whisper —
+a silent CPU fallback has frozen the desktop before. With no remote configured,
+the local model is the engine (explicit choice, works fully offline).
 
 Setup:
     uv sync                           # build .venv from pyproject.toml
@@ -117,7 +119,7 @@ def _http():
 class VoiceInput:
     def __init__(self, bindings, model_size, device, use_tray, initial_prompt,
                  remote_url=None, api_key=None, local_beam_size=1,
-                 local_cpu_threads=None,
+                 local_cpu_threads=None, local_fallback=False,
                  agent=None, pipelines=None, context_rules=None, tools_config=None,
                  run_context_listener=True, glossary=None):
         self.use_tray = use_tray
@@ -146,6 +148,9 @@ class VoiceInput:
         self.remote_url = remote_url
         self.api_key = api_key
         self.use_remote = bool(remote_url and api_key)
+        # Remote-only by default: a failed GPU endpoint drops the clip instead of
+        # silently decoding on local CPU. Opt in via [stt].local_fallback = true.
+        self.local_fallback = bool(local_fallback)
         self._model_size = model_size
         self._device = device
         self._compute = "int8" if device == "cpu" else "float16"
@@ -191,7 +196,9 @@ class VoiceInput:
             print(f"glossary: {self.glossary.count(chr(10)) + 1} terms (LLM passes)")
         if self.reasoning_effort:
             print(f"reasoning_effort: {self.reasoning_effort}")
-        where = "remote+local-fallback" if self.use_remote else f"local {self._model_size}"
+        where = (f"local {self._model_size}" if not self.use_remote
+                 else "remote+local-fallback" if self.local_fallback
+                 else "remote GPU only")
         keys = ", ".join(f"[{b['key']}]={b['label']}" for b in self.bindings)
         print(f"ready ({where}) — hold {keys}")
 
@@ -355,7 +362,13 @@ class VoiceInput:
                 try:
                     text = self._transcribe_remote(audio, model, language)
                     source = f"{label} · GPU"
-                except Exception as e:  # endpoint down / network → offline fallback
+                except Exception as e:  # endpoint down / network
+                    if not self.local_fallback:
+                        print(f"[remote STT failed: {e} — clip dropped, "
+                              f"local fallback disabled]")
+                        self._notify(f"remote STT failed: {e}", "⚠ clip dropped")
+                        self._cue("dialog-warning.oga")
+                        return
                     print(f"[remote STT failed: {e} — using local]")
             if text is None:
                 text = self._transcribe_local(audio, language)
@@ -1113,6 +1126,9 @@ def main():
         local_cpu_threads = int(local_cpu_threads) if local_cpu_threads is not None else None
     except (TypeError, ValueError):
         local_cpu_threads = None
+    # Local-CPU decode of a failed remote clip is opt-in: it has frozen the desktop
+    # before, so it must never happen without an explicit config decision.
+    local_fallback = bool(stt.get("local_fallback", False))
 
     bindings = [dict(b) for b in BINDINGS]
     if args.language:  # global override across all keys
@@ -1139,6 +1155,7 @@ def main():
 
     VoiceInput(bindings, args.model, args.device, args.tray,
                prompt, remote_url, api_key, local_beam_size, local_cpu_threads,
+               local_fallback,
                agent=agent, pipelines=pipelines, context_rules=context_rules,
                tools_config=tools_config,
                run_context_listener=not args.no_context_listener,
