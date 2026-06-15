@@ -125,6 +125,80 @@ def _http():
     return _SESSION
 
 
+class _CartesiaStreamer:
+    """Live STT over Cartesia's realtime websocket (ink-2): transcribe WHILE the
+    user speaks so the result is ready the instant the key is released, instead of
+    uploading the whole clip afterward. The PortAudio callback only feed()s 16-bit
+    PCM into a queue (never blocking on the socket); a sender thread drains it to
+    the socket and a receiver thread accumulates is_final transcript deltas — so
+    socket I/O and a wedged network never touch the audio or key-listener threads.
+    finish() stops sending, waits for the server's `done`, and returns the text."""
+
+    def __init__(self, url, api_key, model, language, version):
+        from websocket import create_connection
+        ws_url = (f"{url}?model={model}&encoding=pcm_s16le"
+                  f"&sample_rate={SAMPLE_RATE}&language={language or 'en'}"
+                  f"&cartesia_version={version}")
+        self._ws = create_connection(
+            ws_url, header=[f"X-API-Key: {api_key}"], timeout=30)
+        self._q = queue.Queue()
+        self._text = ""
+        self._error = None
+        self._recv = threading.Thread(target=self._recv_loop, daemon=True)
+        self._send = threading.Thread(target=self._send_loop, daemon=True)
+        self._recv.start()
+        self._send.start()
+
+    def feed(self, pcm_bytes):
+        self._q.put(pcm_bytes)
+
+    def _send_loop(self):
+        try:
+            while True:
+                item = self._q.get()
+                if item is None:  # sentinel: stop sending, flush the utterance
+                    break
+                self._ws.send_binary(item)
+            self._ws.send("finalize")
+            self._ws.send("close")
+        except Exception as e:
+            self._error = self._error or e
+
+    def _recv_loop(self):
+        try:
+            while True:
+                msg = json.loads(self._ws.recv())
+                kind = msg.get("type")
+                if kind == "transcript" and msg.get("is_final"):
+                    self._text += msg.get("text", "")  # deltas — don't strip/join
+                elif kind == "error":
+                    raise RuntimeError(msg.get("message", "cartesia ws error"))
+                elif kind == "done":
+                    return
+        except Exception as e:
+            self._error = self._error or e
+
+    def finish(self):
+        """Flush remaining audio, wait for the server's `done`, return transcript."""
+        self._q.put(None)
+        self._recv.join(timeout=30)
+        try:
+            self._ws.close()
+        except Exception:
+            pass
+        if self._error:
+            raise self._error
+        return self._text
+
+    def abort(self):
+        """Tear down without finalizing — the clip was too short or cancelled."""
+        self._q.put(None)
+        try:
+            self._ws.close()
+        except Exception:
+            pass
+
+
 class VoiceInput:
     def __init__(self, bindings, model_size, device, use_tray, initial_prompt,
                  remote_url=None, api_key=None, local_beam_size=1,
@@ -139,6 +213,7 @@ class VoiceInput:
         self.recording = False
         self.frames = []
         self.stream = None
+        self._streamer = None  # live Cartesia realtime socket while a ws key records
         self._watchdog = None  # auto-stop timer; guards a missed key-release
         self._lock = threading.Lock()
         self.tray = None
@@ -276,9 +351,29 @@ class VoiceInput:
         self._watchdog.daemon = True
         self._watchdog.start()
 
+    def _open_streamer(self, binding):
+        """Open a live Cartesia realtime socket for a streaming binding (wss:// url),
+        else None. Runs on the stream-open worker — the TLS handshake blocks like the
+        audio-device open and must never stall key handling. A failure here is not
+        fatal: we return None and the buffered frames fall back to batch/local STT."""
+        remote = self._remote_for(binding)
+        if not remote:
+            return None
+        url, api_key, provider = remote
+        if provider != "cartesia" or not url.startswith("ws"):
+            return None
+        try:
+            return _CartesiaStreamer(url, api_key, binding["model"],
+                                     binding["language"],
+                                     binding.get("version", CARTESIA_VERSION))
+        except Exception as e:
+            print(f"[cartesia stream open failed: {e} — buffering for batch/local]")
+            return None
+
     def _open_stream(self, binding):
-        """Worker: bring up the input stream, or discard it if the key was already
-        released (or re-bound) before the device finished opening."""
+        """Worker: bring up the input stream (+ live STT socket for a ws binding), or
+        discard both if the key was already released before the device finished."""
+        streamer = self._open_streamer(binding)
         try:
             stream = sd.InputStream(
                 samplerate=SAMPLE_RATE,
@@ -290,11 +385,16 @@ class VoiceInput:
             stream.start()
         except Exception as e:
             print(f"[audio open failed: {e}]")
+            if streamer is not None:
+                streamer.abort()
             return
         with self._lock:
             if self.recording and self._active is binding:
                 self.stream = stream
+                self._streamer = streamer
                 return
+        if streamer is not None:
+            streamer.abort()
         try:
             stream.stop()
             stream.close()
@@ -302,8 +402,13 @@ class VoiceInput:
             print(f"[audio close failed: {e}]")
 
     def _audio_cb(self, indata, frames, time_info, status):
-        if self.recording:
-            self.frames.append(indata.copy())
+        if not self.recording:
+            return
+        chunk = indata.copy()
+        self.frames.append(chunk)
+        streamer = self._streamer
+        if streamer is not None:  # live-stream this chunk to Cartesia in real time
+            streamer.feed(chunk.tobytes())
 
     def _auto_stop(self):
         """Watchdog fire: a key-release was never seen. Stop as if released."""
@@ -322,16 +427,17 @@ class VoiceInput:
             self.recording = False
             binding = self._active
             stream, self.stream = self.stream, None
+            streamer, self._streamer = self._streamer, None
         if self._watchdog is not None:
             self._watchdog.cancel()
             self._watchdog = None
         self._cue("message.oga")  # mic off, transcribing
-        # The audio callback no longer appends once `recording` is False, so the
-        # frames are frozen and safe to read from the worker.
-        threading.Thread(target=self._finish, args=(stream, binding),
+        # The audio callback no longer appends/feeds once `recording` is False, so
+        # the frames and the live socket are frozen and safe to read from the worker.
+        threading.Thread(target=self._finish, args=(stream, binding, streamer),
                          daemon=True).start()
 
-    def _finish(self, stream, binding):
+    def _finish(self, stream, binding, streamer):
         """Off the listener thread: close the stream, then transcribe."""
         if stream is not None:  # None if the device never finished opening
             try:
@@ -341,6 +447,8 @@ class VoiceInput:
                 print(f"[audio close failed: {e}]")
 
         if not self.frames:
+            if streamer is not None:
+                streamer.abort()
             print("(empty)")
             self._set_state("idle")
             return
@@ -349,6 +457,8 @@ class VoiceInput:
         duration = len(audio) / SAMPLE_RATE
 
         if duration < 0.3:
+            if streamer is not None:
+                streamer.abort()
             print(f"{duration:.1f}s — too short, skipped")
             self._set_state("idle")
             return
@@ -356,7 +466,7 @@ class VoiceInput:
         sys.stdout.write(f"{duration:.1f}s ")
         sys.stdout.flush()
         self._set_state("busy")
-        self._transcribe(audio, binding)
+        self._transcribe(audio, binding, streamer)
 
     def _ensure_local_model(self):
         if self.model is None:
@@ -375,12 +485,27 @@ class VoiceInput:
         key = binding.get("api_key") or self.api_key
         return (url, key, binding.get("provider", "openai")) if url and key else None
 
-    def _transcribe(self, audio, binding):
+    def _transcribe(self, audio, binding, streamer=None):
         try:
             label = binding["label"]
             text, source = None, None
-            remote = self._remote_for(binding)
-            if remote:
+            # A live realtime socket (streamer) already transcribed the audio as it
+            # was spoken — just finalize and read it. Otherwise transcribe the
+            # buffered clip remotely (or locally). Either way, identical downstream.
+            remote = None if streamer is not None else self._remote_for(binding)
+            if streamer is not None:
+                try:
+                    text = streamer.finish()
+                    source = f"{label} · {binding['model']}"
+                except Exception as e:
+                    if not self.local_fallback:
+                        print(f"[cartesia stream failed: {e} — clip dropped, "
+                              f"local fallback disabled]")
+                        self._notify(f"cartesia stream failed: {e}", "⚠ clip dropped")
+                        self._cue("dialog-warning.oga")
+                        return
+                    print(f"[cartesia stream failed: {e} — using local]")
+            elif remote:
                 try:
                     text = self._transcribe_remote(audio, binding, remote)
                     provider = remote[2]
@@ -395,7 +520,7 @@ class VoiceInput:
                     print(f"[remote STT failed: {e} — using local]")
             if text is None:
                 text = self._transcribe_local(audio, binding["language"])
-                source = (f"⚠ {label}→local · {self._model_size}" if remote
+                source = (f"⚠ {label}→local · {self._model_size}" if (remote or streamer)
                           else f"{label} · local {self._model_size}")
             text = (text or "").strip()
 
