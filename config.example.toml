@@ -36,10 +36,15 @@ url = "http://localhost:8080/v1/audio/transcriptions"
 #                        # Off by default — fail fast instead of pinning the CPU.
 #
 # Per-key STT overrides: route a binding (by label: raw/clean/agent) to its own
-# model/url/language. Lets the raw key use a fast English-only engine on a
-# separate server while the LLM-pass keys keep multilingual whisper.
+# model/url/language/provider. Lets the raw key use a fast hosted engine while the
+# LLM-pass keys keep multilingual whisper on the self-hosted GPU.
+#   provider     = "openai" (default, /v1/audio/transcriptions) or "cartesia".
+#   api_key_env  = name of an env var holding this key's credential (else inline
+#                  api_key = "..."); absent both, the shared [stt] key is reused.
+#   version      = Cartesia API version override (default pinned in voice_input.py).
 # [stt.models]
-# raw   = { model = "parakeet-tdt-0.6b-v2", url = "http://host:8031/v1/audio/transcriptions", language = "en" }
+# # ctrl key → Cartesia's hosted batch STT (ink-whisper), its own sk_car_… key:
+# raw   = { provider = "cartesia", model = "ink-whisper", url = "https://api.cartesia.ai/stt", language = "en", api_key_env = "CARTESIA_API_KEY" }
 # clean = { model = "deepdml/faster-whisper-large-v3-turbo-ct2" }
 # beam_size = 1   # local-fallback decode width. 1 (greedy) is ~3x faster on CPU
 #                 # with marginally higher WER on short clips; raise to 5 for the

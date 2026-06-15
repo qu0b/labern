@@ -60,6 +60,9 @@ except ImportError:  # pragma: no cover — py3.9/3.10 fallback
 
 SAMPLE_RATE = 16000
 SOUNDS = "/usr/share/sounds/freedesktop/stereo"
+# Default API version for Cartesia's batch STT (provider = "cartesia"). Pinned per
+# their docs; a binding may override it with version = "..." in [stt.models].
+CARTESIA_VERSION = "2026-03-01"
 # Hard ceiling on a single push-to-talk recording. pynput drops modifier
 # key-release events on X11 often enough that a stuck key is a real failure
 # mode: without this, the mic stream stays open and `frames` grows unbounded.
@@ -73,6 +76,9 @@ MAX_RECORD_SECONDS = 120
 # Parakeet (English-only, native punctuation) is retired from the default layout
 # because the clean-up/agent passes must handle German too — re-add a binding with
 # model="parakeet-tdt-0.6b-v2", language="en" if you want a fast English-only key.
+# A binding can also target a non-OpenAI STT provider via [stt.models]: set
+# provider="cartesia" (model="ink-whisper", its own api_key_env) to route one key
+# to Cartesia's hosted batch STT instead of the self-hosted GPU endpoint.
 BINDINGS = [
     {"key": "ctrl_r",  "model": "whisper-large-v3-turbo", "language": None, "label": "raw"},
     {"key": "shift_r", "model": "whisper-large-v3-turbo", "language": None, "label": "clean",
@@ -147,7 +153,10 @@ class VoiceInput:
         # GPU-hosted endpoint preferred when a key is present; local is a lazy fallback.
         self.remote_url = remote_url
         self.api_key = api_key
-        self.use_remote = bool(remote_url and api_key)
+        # A key goes remote if it resolves to a (url, api_key) pair — per-binding
+        # [stt.models] overrides or the shared defaults. use_remote is just "any
+        # key can"; the live decision is per binding in _remote_for / _transcribe.
+        self.use_remote = any(self._remote_for(b) for b in self.bindings)
         # Remote-only by default: a failed GPU endpoint drops the clip instead of
         # silently decoding on local CPU. Opt in via [stt].local_fallback = true.
         self.local_fallback = bool(local_fallback)
@@ -354,15 +363,25 @@ class VoiceInput:
                 self._model_size, device=self._device, compute_type=self._compute,
                 cpu_threads=self._cpu_threads)
 
+    def _remote_for(self, binding):
+        """Resolve a binding's remote STT target as (url, api_key, provider), or
+        None to decode locally. Per-key [stt.models] url/api_key/provider override
+        the shared defaults, so one key can hit Cartesia while the rest stay on the
+        self-hosted GPU endpoint."""
+        url = binding.get("url") or self.remote_url
+        key = binding.get("api_key") or self.api_key
+        return (url, key, binding.get("provider", "openai")) if url and key else None
+
     def _transcribe(self, audio, binding):
         try:
-            model, language, label = binding["model"], binding["language"], binding["label"]
+            label = binding["label"]
             text, source = None, None
-            if self.use_remote:
+            remote = self._remote_for(binding)
+            if remote:
                 try:
-                    text = self._transcribe_remote(audio, model, language,
-                                                   binding.get("url"))
-                    source = f"{label} · GPU"
+                    text = self._transcribe_remote(audio, binding, remote)
+                    provider = remote[2]
+                    source = f"{label} · {'GPU' if provider == 'openai' else provider}"
                 except Exception as e:  # endpoint down / network
                     if not self.local_fallback:
                         print(f"[remote STT failed: {e} — clip dropped, "
@@ -372,8 +391,8 @@ class VoiceInput:
                         return
                     print(f"[remote STT failed: {e} — using local]")
             if text is None:
-                text = self._transcribe_local(audio, language)
-                source = (f"⚠ {label}→local · {self._model_size}" if self.use_remote
+                text = self._transcribe_local(audio, binding["language"])
+                source = (f"⚠ {label}→local · {self._model_size}" if remote
                           else f"{label} · local {self._model_size}")
             text = (text or "").strip()
 
@@ -425,9 +444,13 @@ class VoiceInput:
         segments, _ = self.model.transcribe(audio_f32, **opts)
         return " ".join(seg.text for seg in segments)
 
-    def _transcribe_remote(self, audio, model, language, url=None):
-        """POST the clip to an OpenAI-compatible /v1/audio/transcriptions endpoint.
-        `url` lets a binding target its own STT server (see [stt.models])."""
+    def _transcribe_remote(self, audio, binding, remote):
+        """POST the clip to the binding's remote STT endpoint and return the text.
+        `remote` is (url, api_key, provider) from _remote_for. provider="openai"
+        hits an OpenAI-compatible /v1/audio/transcriptions endpoint; "cartesia"
+        hits Cartesia's batch STT, which needs a pinned Cartesia-Version header and
+        has no OpenAI-style 'prompt' bias field (sending one is a 422)."""
+        url, api_key, provider = remote
         buf = io.BytesIO()
         with wave.open(buf, "wb") as w:
             w.setnchannels(1)
@@ -435,14 +458,17 @@ class VoiceInput:
             w.setframerate(SAMPLE_RATE)
             w.writeframes(audio.tobytes())
         buf.seek(0)
-        data = {"model": model}
-        if language:
-            data["language"] = language
-        if self.initial_prompt:
+        headers = {"Authorization": f"Bearer {api_key}"}
+        data = {"model": binding["model"]}
+        if binding["language"]:
+            data["language"] = binding["language"]
+        if provider == "cartesia":
+            headers["Cartesia-Version"] = binding.get("version", CARTESIA_VERSION)
+        elif self.initial_prompt:
             data["prompt"] = self.initial_prompt  # OpenAI's term-bias field
         resp = _http().post(
-            url or self.remote_url,
-            headers={"Authorization": f"Bearer {self.api_key}"},
+            url,
+            headers=headers,
             files={"file": ("audio.wav", buf, "audio/wav")},
             data=data,
             timeout=30,
@@ -1139,11 +1165,22 @@ def main():
 
     bindings = [dict(b) for b in BINDINGS]
     # Per-key STT overrides: [stt.models] maps a binding label to its own
-    # model/url/language (e.g. raw -> parakeet on a separate server).
+    # model/url/language/provider (e.g. raw -> Cartesia's hosted STT). The key's
+    # own credential comes from api_key_env (env var name) or an inline api_key;
+    # absent both, it falls back to the shared key.
     for label, ov in (stt.get("models") or {}).items():
         for b in bindings:
             if b["label"] == label:
-                b.update({k: ov[k] for k in ("model", "url", "language") if k in ov})
+                b.update({k: ov[k] for k in
+                          ("model", "url", "language", "provider", "version") if k in ov})
+                if ov.get("api_key_env"):
+                    b["api_key"] = os.environ.get(ov["api_key_env"])
+                    if not b["api_key"]:
+                        print(f"[warn: [stt.models].{label} api_key_env="
+                              f"{ov['api_key_env']!r} is unset — that key falls "
+                              f"back to local/shared-key STT]")
+                elif ov.get("api_key"):
+                    b["api_key"] = ov["api_key"]
     if args.language:  # global override across all keys
         for b in bindings:
             b["language"] = args.language
