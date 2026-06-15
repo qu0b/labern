@@ -39,11 +39,15 @@ url = "http://localhost:8080/v1/audio/transcriptions"
 # model/url/language/provider. Lets the raw key use a fast hosted engine while the
 # LLM-pass keys keep multilingual whisper on the self-hosted GPU.
 #   provider     = "openai" (default, /v1/audio/transcriptions) or "cartesia".
+#                  For cartesia, a wss:// url streams to ink-2 (lowest WER, EN-only);
+#                  an https:// url uses batch ink-whisper (multilingual).
 #   api_key_env  = name of an env var holding this key's credential (else inline
 #                  api_key = "..."); absent both, the shared [stt] key is reused.
 #   version      = Cartesia API version override (default pinned in voice_input.py).
 # [stt.models]
-# # ctrl key → Cartesia's hosted batch STT (ink-whisper), its own sk_car_… key:
+# # ctrl key → Cartesia ink-2 realtime STT, its own sk_car_… key:
+# raw   = { provider = "cartesia", model = "ink-2", url = "wss://api.cartesia.ai/stt/websocket", language = "en", api_key_env = "CARTESIA_API_KEY" }
+# # …or batch ink-whisper (multilingual) instead:
 # raw   = { provider = "cartesia", model = "ink-whisper", url = "https://api.cartesia.ai/stt", language = "en", api_key_env = "CARTESIA_API_KEY" }
 # clean = { model = "deepdml/faster-whisper-large-v3-turbo-ct2" }
 # beam_size = 1   # local-fallback decode width. 1 (greedy) is ~3x faster on CPU

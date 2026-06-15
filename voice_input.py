@@ -77,10 +77,11 @@ MAX_RECORD_SECONDS = 120
 # because the clean-up/agent passes must handle German too — re-add a binding with
 # model="parakeet-tdt-0.6b-v2", language="en" if you want a fast English-only key.
 # A binding can also target a non-OpenAI STT provider via [stt.models]: set
-# provider="cartesia" (model="ink-whisper", its own api_key_env) to route one key
-# to Cartesia's hosted batch STT instead of the self-hosted GPU endpoint. Note:
-# ink-whisper takes only file/model/language — it has NO term-bias field, so the
-# vocab.txt prompt that nudges the whisper keys does nothing there.
+# provider="cartesia" (its own api_key_env) to route one key to Cartesia instead
+# of the self-hosted GPU. A wss:// url streams to their realtime model (ink-2,
+# English-only, lowest WER); an https:// url uses batch ink-whisper (multilingual).
+# Neither has a term-bias field, so the vocab.txt prompt that nudges the whisper
+# keys does nothing on a Cartesia key.
 BINDINGS = [
     {"key": "ctrl_r",  "model": "whisper-large-v3-turbo", "language": None, "label": "raw"},
     {"key": "shift_r", "model": "whisper-large-v3-turbo", "language": None, "label": "clean",
@@ -447,13 +448,16 @@ class VoiceInput:
         return " ".join(seg.text for seg in segments)
 
     def _transcribe_remote(self, audio, binding, remote):
-        """POST the clip to the binding's remote STT endpoint and return the text.
+        """Transcribe the clip via the binding's remote endpoint and return text.
         `remote` is (url, api_key, provider) from _remote_for. provider="openai"
-        hits an OpenAI-compatible /v1/audio/transcriptions endpoint; "cartesia"
-        hits Cartesia's batch STT, which needs a pinned Cartesia-Version header and
-        accepts only file/model/language — it has no term-bias field (a 'prompt' is
-        silently ignored), so we skip sending one."""
+        hits an OpenAI-compatible /v1/audio/transcriptions endpoint. "cartesia"
+        routes by URL scheme: a wss:// url streams the clip to Cartesia's realtime
+        STT (ink-2; see _transcribe_cartesia_ws), an https:// url uses their batch
+        STT — which needs a Cartesia-Version header and accepts only
+        file/model/language (no term-bias field; a 'prompt' is silently ignored)."""
         url, api_key, provider = remote
+        if provider == "cartesia" and url.startswith("ws"):
+            return self._transcribe_cartesia_ws(audio, binding, url, api_key)
         buf = io.BytesIO()
         with wave.open(buf, "wb") as w:
             w.setnchannels(1)
@@ -478,6 +482,39 @@ class VoiceInput:
         )
         resp.raise_for_status()
         return resp.json().get("text", "")
+
+    def _transcribe_cartesia_ws(self, audio, binding, url, api_key):
+        """Stream the clip to Cartesia's realtime STT websocket (ink-2). Push-to-talk
+        already holds the whole buffer at key-release, so we send every 100 ms PCM
+        chunk back-to-back, then 'finalize' + 'close' and concatenate the is_final
+        transcript deltas until 'done'. Manual mode — we own start/stop, so no turn
+        detection. ink-2 is English-only; language defaults to en."""
+        from websocket import create_connection
+        version = binding.get("version", CARTESIA_VERSION)
+        language = binding["language"] or "en"
+        ws_url = (f"{url}?model={binding['model']}&encoding=pcm_s16le"
+                  f"&sample_rate={SAMPLE_RATE}&language={language}"
+                  f"&cartesia_version={version}")
+        ws = create_connection(ws_url, header=[f"X-API-Key: {api_key}"], timeout=30)
+        try:
+            pcm = audio.tobytes()  # int16 mono == pcm_s16le
+            step = (SAMPLE_RATE * 2) // 10  # 100 ms of 16-bit samples
+            for i in range(0, len(pcm), step):
+                ws.send_binary(pcm[i:i + step])
+            ws.send("finalize")
+            ws.send("close")
+            text = ""
+            while True:
+                msg = json.loads(ws.recv())
+                kind = msg.get("type")
+                if kind == "transcript" and msg.get("is_final"):
+                    text += msg.get("text", "")  # deltas — don't strip or re-join
+                elif kind == "error":
+                    raise RuntimeError(msg.get("message", "cartesia ws error"))
+                elif kind == "done":
+                    return text
+        finally:
+            ws.close()
 
     # ---- transform pipeline + context routing -------------------------------
 

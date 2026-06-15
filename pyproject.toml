@@ -13,6 +13,7 @@ dependencies = [
     "pystray>=0.19.5",
     "Pillow>=10.0.0",
     "requests>=2.28.0",
+    "websocket-client>=1.6",  # sync ws client for Cartesia ink-2 realtime STT
     "tomli>=2.0; python_version < '3.11'",  # py3.11+ has stdlib tomllib
 ]
 
