@@ -134,7 +134,7 @@ class _CartesiaStreamer:
     socket I/O and a wedged network never touch the audio or key-listener threads.
     finish() stops sending, waits for the server's `done`, and returns the text."""
 
-    def __init__(self, url, api_key, model, language, version):
+    def __init__(self, url, api_key, model, language, version, on_delta=None):
         from websocket import create_connection
         ws_url = (f"{url}?model={model}&encoding=pcm_s16le"
                   f"&sample_rate={SAMPLE_RATE}&language={language or 'en'}"
@@ -144,6 +144,10 @@ class _CartesiaStreamer:
         self._q = queue.Queue()
         self._text = ""
         self._error = None
+        # When set, each is_final delta is typed the moment it arrives (live
+        # dictation). `typed` lets the caller skip a duplicate type-on-release.
+        self._on_delta = on_delta
+        self.typed = bool(on_delta)
         self._recv = threading.Thread(target=self._recv_loop, daemon=True)
         self._send = threading.Thread(target=self._send_loop, daemon=True)
         self._recv.start()
@@ -170,7 +174,10 @@ class _CartesiaStreamer:
                 msg = json.loads(self._ws.recv())
                 kind = msg.get("type")
                 if kind == "transcript" and msg.get("is_final"):
-                    self._text += msg.get("text", "")  # deltas — don't strip/join
+                    delta = msg.get("text", "")  # deltas — don't strip/join
+                    self._text += delta
+                    if self._on_delta and delta:
+                        self._on_delta(delta)  # type it live, as it's spoken
                 elif kind == "error":
                     raise RuntimeError(msg.get("message", "cartesia ws error"))
                 elif kind == "done":
@@ -362,10 +369,14 @@ class VoiceInput:
         url, api_key, provider = remote
         if provider != "cartesia" or not url.startswith("ws"):
             return None
+        # Type deltas live only on a raw key (no pipeline): a transform pass rewrites
+        # the text after release, so live-typing the raw words there would be wrong.
+        on_delta = None if binding.get("pipeline") else self._type
         try:
             return _CartesiaStreamer(url, api_key, binding["model"],
                                      binding["language"],
-                                     binding.get("version", CARTESIA_VERSION))
+                                     binding.get("version", CARTESIA_VERSION),
+                                     on_delta=on_delta)
         except Exception as e:
             print(f"[cartesia stream open failed: {e} — buffering for batch/local]")
             return None
@@ -489,6 +500,7 @@ class VoiceInput:
         try:
             label = binding["label"]
             text, source = None, None
+            live_typed = False  # streamer already typed the text as it was spoken
             # A live realtime socket (streamer) already transcribed the audio as it
             # was spoken — just finalize and read it. Otherwise transcribe the
             # buffered clip remotely (or locally). Either way, identical downstream.
@@ -497,6 +509,7 @@ class VoiceInput:
                 try:
                     text = streamer.finish()
                     source = f"{label} · {binding['model']}"
+                    live_typed = streamer.typed
                 except Exception as e:
                     if not self.local_fallback:
                         print(f"[cartesia stream failed: {e} — clip dropped, "
@@ -551,7 +564,7 @@ class VoiceInput:
                         return
 
             print(f"-> [{source}] {text}")
-            if text.strip():
+            if text.strip() and not live_typed:  # live stream already typed it
                 self._type(text)
             if images and self.image_output:
                 self._emit_image(images[-1])  # most recent screenshot → clipboard
