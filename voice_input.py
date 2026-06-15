@@ -78,7 +78,9 @@ MAX_RECORD_SECONDS = 120
 # model="parakeet-tdt-0.6b-v2", language="en" if you want a fast English-only key.
 # A binding can also target a non-OpenAI STT provider via [stt.models]: set
 # provider="cartesia" (model="ink-whisper", its own api_key_env) to route one key
-# to Cartesia's hosted batch STT instead of the self-hosted GPU endpoint.
+# to Cartesia's hosted batch STT instead of the self-hosted GPU endpoint. Note:
+# ink-whisper takes only file/model/language — it has NO term-bias field, so the
+# vocab.txt prompt that nudges the whisper keys does nothing there.
 BINDINGS = [
     {"key": "ctrl_r",  "model": "whisper-large-v3-turbo", "language": None, "label": "raw"},
     {"key": "shift_r", "model": "whisper-large-v3-turbo", "language": None, "label": "clean",
@@ -449,7 +451,8 @@ class VoiceInput:
         `remote` is (url, api_key, provider) from _remote_for. provider="openai"
         hits an OpenAI-compatible /v1/audio/transcriptions endpoint; "cartesia"
         hits Cartesia's batch STT, which needs a pinned Cartesia-Version header and
-        has no OpenAI-style 'prompt' bias field (sending one is a 422)."""
+        accepts only file/model/language — it has no term-bias field (a 'prompt' is
+        silently ignored), so we skip sending one."""
         url, api_key, provider = remote
         buf = io.BytesIO()
         with wave.open(buf, "wb") as w:
