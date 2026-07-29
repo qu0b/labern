@@ -90,6 +90,19 @@ BINDINGS = [
      "pipeline": "agent"},
 ]
 
+# The fields a [stt.models] override — or a tray engine switch — may set on a
+# binding. One list so the startup path and the runtime path cannot drift.
+ENGINE_FIELDS = ("model", "url", "language", "provider", "version")
+
+# Engines offered in the tray's per-key submenu. [stt.catalog] in config.toml
+# replaces this wholesale; the point is that switching engine is a click, not a
+# config edit plus a restart. Anything reachable through the LiteLLM gateway
+# needs only a model name — url/api_key come from the shared [stt] defaults.
+ENGINE_CATALOG = {
+    "whisper (multilingual)": {"model": "whisper-large-v3-turbo", "language": None},
+    "parakeet (EN, fast)": {"model": "parakeet-tdt-0.6b-v2", "language": "en"},
+}
+
 # The AT-SPI helper that snapshots the focused widget; run on demand per dictation.
 CONTEXT_HELPER = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "voice_input_context.py")
@@ -97,6 +110,31 @@ CONTEXT_HELPER = os.path.join(
 # The interactive agent panel (Tkinter), spawned when a tool-using pipeline fires.
 PANEL_HELPER = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "voice_input_panel.py")
+
+
+def _apply_engine(binding, entry):
+    """Point one binding at one engine, in place.
+
+    Used both when [stt.models] is read at startup and when the tray switches a
+    key at runtime — the binding dicts are the same objects the keymap holds, so
+    a switch takes effect on the next dictation without a restart.
+
+    `language` is assigned whenever the entry mentions it (including None, which
+    means auto-detect); the other fields are only overwritten when present, so a
+    terse catalog entry inherits the shared [stt] defaults.
+    """
+    for field in ENGINE_FIELDS:
+        if field in entry:
+            binding[field] = entry[field] or None if field == "language" else entry[field]
+    if entry.get("api_key_env"):
+        binding["api_key"] = os.environ.get(entry["api_key_env"])
+        if not binding["api_key"]:
+            print(f"[warn: engine {entry.get('model')!r} api_key_env="
+                  f"{entry['api_key_env']!r} is unset — that key falls back to "
+                  f"local/shared-key STT]")
+    elif entry.get("api_key"):
+        binding["api_key"] = entry["api_key"]
+    return binding
 
 
 def _make_icon(color):
@@ -204,7 +242,7 @@ class VoiceInput:
                  remote_url=None, api_key=None, local_beam_size=1,
                  local_cpu_threads=None, local_fallback=False,
                  agent=None, pipelines=None, context_rules=None, tools_config=None,
-                 run_context_listener=True, glossary=None):
+                 run_context_listener=True, glossary=None, engine_catalog=None):
         self.use_tray = use_tray
         self.initial_prompt = initial_prompt
         # Technical-term dictionary for the LLM passes: substituted into any step
@@ -227,6 +265,10 @@ class VoiceInput:
             rb = dict(b, keyobj=self._resolve_key(b["key"]))
             self.bindings.append(rb)
             self._keymap[rb["keyobj"]] = rb
+
+        # Engines the tray can switch a key to at runtime. Same dicts the keymap
+        # holds get mutated, so a switch needs no restart.
+        self.engine_catalog = dict(engine_catalog or {})
 
         # GPU-hosted endpoint preferred when a key is present; local is a lazy fallback.
         self.remote_url = remote_url
@@ -1180,6 +1222,8 @@ class VoiceInput:
         menu = pystray.Menu(
             pystray.MenuItem(lambda _: f"hold {keys}", None, enabled=False),
             pystray.Menu.SEPARATOR,
+            *self._engine_menu_items(pystray),
+            pystray.Menu.SEPARATOR,
             pystray.MenuItem("quit", self._quit),
         )
         self.tray = pystray.Icon(
@@ -1187,6 +1231,40 @@ class VoiceInput:
             "voice-input - idle", menu=menu,
         )
         self.tray.run()
+
+    def _engine_menu_items(self, pystray):
+        """One submenu per key, listing the engines it can be switched to.
+
+        Radio-checked against the binding's live model, so the menu always shows
+        what the key will actually use rather than what it was started with.
+        """
+        if not self.engine_catalog:
+            return ()
+
+        def item_for(binding, name, entry):
+            return pystray.MenuItem(
+                name,
+                lambda _i, _it, b=binding, e=entry, n=name: self._switch_engine(b, e, n),
+                checked=lambda _it, b=binding, e=entry: b.get("model") == e.get("model"),
+                radio=True,
+            )
+
+        return tuple(
+            pystray.MenuItem(
+                f"{b['label']} [{b['key']}]",
+                pystray.Menu(*(item_for(b, n, e) for n, e in self.engine_catalog.items())),
+            )
+            for b in self.bindings
+        )
+
+    def _switch_engine(self, binding, entry, name):
+        """Repoint one key at another engine, effective next dictation."""
+        _apply_engine(binding, entry)
+        # use_remote is a startup-wide "can any key go remote"; recompute it so
+        # switching the last remote key to a local one doesn't strand the flag.
+        self.use_remote = any(self._remote_for(b) for b in self.bindings)
+        print(f"[engine {binding['label']} -> {binding['model']}]")
+        self._notify(binding["model"], f"{binding['label']} engine")
 
 
 def _load_vocab(path):
@@ -1336,19 +1414,22 @@ def main():
     for label, ov in (stt.get("models") or {}).items():
         for b in bindings:
             if b["label"] == label:
-                b.update({k: ov[k] for k in
-                          ("model", "url", "language", "provider", "version") if k in ov})
-                if ov.get("api_key_env"):
-                    b["api_key"] = os.environ.get(ov["api_key_env"])
-                    if not b["api_key"]:
-                        print(f"[warn: [stt.models].{label} api_key_env="
-                              f"{ov['api_key_env']!r} is unset — that key falls "
-                              f"back to local/shared-key STT]")
-                elif ov.get("api_key"):
-                    b["api_key"] = ov["api_key"]
+                _apply_engine(b, ov)
     if args.language:  # global override across all keys
         for b in bindings:
             b["language"] = args.language
+
+    # Engines selectable from the tray at runtime. [stt.catalog] replaces the
+    # built-in list; whatever each key is using at startup is added so the menu
+    # can always show the current selection as checked.
+    engine_catalog = dict(stt.get("catalog") or ENGINE_CATALOG)
+    known = {e.get("model") for e in engine_catalog.values()}
+    for b in bindings:
+        if b.get("model") and b["model"] not in known:
+            engine_catalog[f"{b['model']} (current)"] = {
+                k: b[k] for k in ENGINE_FIELDS if k in b
+            }
+            known.add(b["model"])
 
     agent = dict(config.get("agent") or {})
     if args.agent_url:
@@ -1374,7 +1455,7 @@ def main():
                agent=agent, pipelines=pipelines, context_rules=context_rules,
                tools_config=tools_config,
                run_context_listener=not args.no_context_listener,
-               glossary=glossary).run()
+               glossary=glossary, engine_catalog=engine_catalog).run()
 
 
 if __name__ == "__main__":

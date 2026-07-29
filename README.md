@@ -33,6 +33,28 @@ that produced it (so you can see at a glance whether it ran remote or local).
 The two key/engine mappings, including the remote model names, live in the
 `BINDINGS` list at the top of `voice_input.py` — edit it to taste.
 
+### Switching engine without a restart
+
+Right-click the tray icon → pick a key → pick an engine. It applies to that
+key's **next** dictation; nothing restarts, no config is edited, and the menu
+radio-checks whichever engine the key is actually on.
+
+```
+🎤 voice-input
+   hold [ctrl_r]=raw · [shift_r]=clean · [alt_r]=agent
+   ─────────────
+   raw   [ctrl_r]   ▸   ● whisper (multilingual)
+   clean [shift_r]  ▸   ○ parakeet (EN, fast)
+   agent [alt_r]    ▸   ○ ink-2 (Cartesia)
+   ─────────────
+   quit
+```
+
+The list comes from `[stt.catalog]` in `config.toml` (same entry shape as
+`[stt.models]`); omit it for the built-in whisper + parakeet pair. Whatever a
+key starts on is always listed, so a `[stt.models]` override stays visible and
+switchable.
+
 ## Install
 
 ### Linux (X11 or Wayland)

@@ -44,6 +44,17 @@ url = "http://localhost:8080/v1/audio/transcriptions"
 #   api_key_env  = name of an env var holding this key's credential (else inline
 #                  api_key = "..."); absent both, the shared [stt] key is reused.
 #   version      = Cartesia API version override (default pinned in voice_input.py).
+# Tray engine switcher: [stt.catalog] lists the engines each key can be
+# switched to at runtime — right-click the tray icon, pick a key, pick an
+# engine. It takes effect on the next dictation, no restart and no config edit.
+# The entry shape is the same as [stt.models] below; a bare model name inherits
+# url/api_key from [stt]. Omit the section to get the built-in list
+# (whisper + parakeet). Whatever a key starts on is always listed too.
+# [stt.catalog]
+# "whisper (multilingual)" = { model = "whisper-large-v3-turbo", language = "" }
+# "parakeet (EN, fast)"    = { model = "parakeet-tdt-0.6b-v2", language = "en" }
+# "ink-2 (Cartesia)"       = { provider = "cartesia", model = "ink-2", url = "wss://api.cartesia.ai/stt/websocket", language = "en", api_key_env = "CARTESIA_API_KEY" }
+
 # [stt.models]
 # # ctrl key → Cartesia ink-2 realtime STT, its own sk_car_… key:
 # raw   = { provider = "cartesia", model = "ink-2", url = "wss://api.cartesia.ai/stt/websocket", language = "en", api_key_env = "CARTESIA_API_KEY" }
